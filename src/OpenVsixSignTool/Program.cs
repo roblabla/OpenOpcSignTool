@@ -25,6 +25,10 @@ namespace OpenVsixSignTool
                     var azureKeyVaultClientSecret = signConfiguration.Option("-kvs | --azure-key-vault-client-secret", "The Client Secret to authenticate to the Azure Key Vault.", CommandOptionType.SingleValue);
                     var azureKeyVaultCertificateName = signConfiguration.Option("-kvc | --azure-key-vault-certificate", "The name of the certificate in Azure Key Vault.", CommandOptionType.SingleValue);
                     var azureKeyVaultAccessToken = signConfiguration.Option("-kva | --azure-key-vault-accesstoken", "The Access Token to authenticate to the Azure Key Vault.", CommandOptionType.SingleValue);
+                    var pkcs11Engine = signConfiguration.Option("--pkcs11-engine", "Path to libpkcs11.", CommandOptionType.SingleValue);
+                    var pkcs11Module = signConfiguration.Option("--pkcs11-module", "Path to the PKCS11 module to use.", CommandOptionType.SingleValue);
+                    var pkcs11Cert = signConfiguration.Option("--pkcs11-cert", "Name of the PKCS11 object representing the certificate to use.", CommandOptionType.SingleValue);
+                    var pkcs11Key = signConfiguration.Option("--pkcs11-key", "Name of the PKCS11 object representing the private key to use.", CommandOptionType.SingleValue);
 
                     signConfiguration.OnExecute(() =>
                     {
@@ -32,6 +36,10 @@ namespace OpenVsixSignTool
                         if (sha1.HasValue() || pfxPath.HasValue() || password.HasValue() || pfxPath.HasValue())
                         {
                             return sign.SignAsync(sha1, pfxPath, password, timestamp, timestampAlgorithm, fileDigest, force, file);
+                        }
+                        else if (pkcs11Engine.HasValue() || pkcs11Module.HasValue() || pkcs11Cert.HasValue() || pkcs11Key.HasValue())
+                        {
+                            return sign.SignPkcs11(pkcs11Engine, pkcs11Module, pkcs11Cert, pkcs11Key, timestamp, timestampAlgorithm, fileDigest, force, file);
                         }
                         else
                         {

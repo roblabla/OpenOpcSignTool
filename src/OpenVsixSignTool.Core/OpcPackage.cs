@@ -212,7 +212,7 @@ namespace OpenVsixSignTool.Core
                 {
                     var newXml = _contentTypes.ToXml();
                     stream.SetLength(0L);
-                    newXml.Save(stream, SaveOptions.None);
+                    newXml.Save(stream, SaveOptions.DisableFormatting);
                     _contentTypes.IsDirty = false;
                 }
             }
@@ -230,7 +230,7 @@ namespace OpenVsixSignTool.Core
             {
                 stream.SetLength(0L);
                 var newXml = relationships.ToXml();
-                newXml.Save(stream, SaveOptions.None);
+                newXml.Save(stream, SaveOptions.DisableFormatting);
             }
         }
 
