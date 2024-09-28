@@ -2,7 +2,7 @@
 
   <PropertyGroup>
     <OutputType>Exe</OutputType>
-    <TargetFramework>net6.0</TargetFramework>
+    <TargetFramework>net8.0</TargetFramework>
     <PackageId>OpenVsixSignTool</PackageId>
     <Copyright>Kevin Jones</Copyright>
     <PackAsTool>true</PackAsTool>
@@ -13,6 +13,7 @@
     <RepositoryUrl>https://github.com/vcsjones/OpenOpcSignTool</RepositoryUrl>
     <PublishRepositoryUrl>true</PublishRepositoryUrl>
     <IsTestProject>false</IsTestProject>
+	<AllowUnsafeBlocks>true</AllowUnsafeBlocks>
   </PropertyGroup>
 
   <ItemGroup>

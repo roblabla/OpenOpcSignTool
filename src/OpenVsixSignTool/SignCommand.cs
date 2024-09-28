@@ -7,6 +7,7 @@ using System.IO.Packaging;
 using System.Linq;
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
+using System.Runtime.InteropServices;
 using System.Threading.Tasks;
 
 namespace OpenVsixSignTool
@@ -114,6 +115,87 @@ namespace OpenVsixSignTool
             }
             return PerformSignOnVsixAsync(vsixPathValue, force.HasValue(), timestampServer, fileDigestAlgorithm, timestampDigestAlgorithm,
                 certificate, GetSigningKeyFromCertificate(certificate));
+        }
+
+        internal Task<int> SignPkcs11
+        (
+            CommandOption pkcs11Module,
+            CommandOption pkcs11Cert,
+            CommandOption pkcs11Key,
+            CommandOption timestampUrl,
+            CommandOption timestampAlgorithm,
+            CommandOption fileDigest,
+            CommandOption force,
+            CommandArgument vsixPath)
+        {
+            if (!pkcs11Module.HasValue() || !pkcs11Cert.HasValue() || !pkcs11Key.HasValue())
+            {
+                _signCommandApplication.Out.WriteLine("--pkcs11-module, --pkcs11-cert and --pkcs11-key must be specified when using PKCS11 signing.");
+                _signCommandApplication.ShowHelp();
+                return Task.FromResult(EXIT_CODES.INVALID_OPTIONS);
+            }
+
+            Uri timestampServer = null;
+            if (timestampUrl.HasValue())
+            {
+                if (!Uri.TryCreate(timestampUrl.Value(), UriKind.Absolute, out timestampServer))
+                {
+                    _signCommandApplication.Out.WriteLine("Specified timestamp URL is invalid.");
+                    return Task.FromResult(EXIT_CODES.FAILED);
+                }
+                if (timestampServer.Scheme != Uri.UriSchemeHttp && timestampServer.Scheme != Uri.UriSchemeHttps)
+                {
+                    _signCommandApplication.Out.WriteLine("Specified timestamp URL is invalid.");
+                    return Task.FromResult(EXIT_CODES.FAILED);
+                }
+            }
+
+            var vsixPathValue = vsixPath.Value;
+            if (!File.Exists(vsixPathValue))
+            {
+                _signCommandApplication.Out.WriteLine("Specified file does not exist.");
+                return Task.FromResult(EXIT_CODES.FAILED);
+            }
+
+            HashAlgorithmName fileDigestAlgorithm, timestampDigestAlgorithm;
+            var fileDigestResult = AlgorithmFromInput(fileDigest.HasValue() ? fileDigest.Value() : null);
+            if (fileDigestResult == null)
+            {
+                _signCommandApplication.Out.WriteLine("Specified file digest algorithm is not supported.");
+                return Task.FromResult(EXIT_CODES.INVALID_OPTIONS);
+            }
+            else
+            {
+                fileDigestAlgorithm = fileDigestResult.Value;
+            }
+            var timestampDigestResult = AlgorithmFromInput(timestampAlgorithm.HasValue() ? timestampAlgorithm.Value() : null);
+            if (timestampDigestResult == null)
+            {
+                _signCommandApplication.Out.WriteLine("Specified timestamp digest algorithm is not supported.");
+                return Task.FromResult(EXIT_CODES.INVALID_OPTIONS);
+            }
+            else
+            {
+                timestampDigestAlgorithm = timestampDigestResult.Value;
+            }
+
+            RSAOpenSsl key = GetSigningKeyFromPkcs11(pkcs11Module.Value(), pkcs11Key.Value());
+            if (key == null)
+            {
+                _signCommandApplication.Out.WriteLine("Unable to locate key on token.");
+                return Task.FromResult(EXIT_CODES.FAILED);
+            }
+
+            X509Certificate2 certificate = GetCertificateFromPkcs11(pkcs11Cert.Value());
+            if (certificate == null)
+            {
+                _signCommandApplication.Out.WriteLine("Unable to locate certificate on token.");
+                return Task.FromResult(EXIT_CODES.FAILED);
+            }
+
+
+            return PerformSignOnVsixAsync(vsixPathValue, force.HasValue(), timestampServer, fileDigestAlgorithm, timestampDigestAlgorithm,
+                certificate, key);
         }
 
         internal async Task<int> SignAzure(CommandOption azureKeyVaultUrl, CommandOption azureKeyVaultClientId,
@@ -257,8 +339,7 @@ namespace OpenVsixSignTool
                         return EXIT_CODES.FAILED;
                     }
                 }
-                _signCommandApplication.Out.WriteLine("The signing operation is complete.");                
-                
+                _signCommandApplication.Out.WriteLine("The signing operation is complete.");
             }
             Package repack = Package.Open(vsixPath);
             repack.Flush();
@@ -324,6 +405,93 @@ namespace OpenVsixSignTool
                 return certificates[0];
             }
 
+        }
+
+        [DllImport("libcrypto.so", CharSet=CharSet.Ansi)]
+        private static extern IntPtr ENGINE_by_id(string engine_name);
+
+        [DllImport("libcrypto.so", CharSet=CharSet.Ansi)]
+        private static extern int ENGINE_init(IntPtr engine);
+
+        [DllImport("libcrypto.so", CharSet=CharSet.Ansi)]
+        private static extern int ENGINE_finish(IntPtr engine);
+
+        [DllImport("libcrypto.so", CharSet=CharSet.Ansi)]
+        private static extern int ENGINE_free(IntPtr engine);
+
+        [DllImport("libcrypto.so", CharSet=CharSet.Ansi)]
+        private static extern int ENGINE_ctrl_cmd(IntPtr engine, string cmd_name, long i, ref Parms p, IntPtr f, int cmd_optional);
+
+        [DllImport("libcrypto.so", CharSet=CharSet.Ansi)]
+        private static extern int ENGINE_ctrl_cmd_string(IntPtr engine, string cmd_name, string arg, int cmd_optional);
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct Parms
+        {
+            public string id;
+            public IntPtr cert; // X509*
+        }
+
+        private X509Certificate2 GetCertificateFromPkcs11(string certName)
+        {
+            IntPtr engine = ENGINE_by_id("pkcs11");
+            X509Certificate2 cert = null;
+
+            if (engine != (IntPtr)0)
+            {
+                if (ENGINE_init(engine) != 0)
+                {
+                    Parms parms = new Parms { id = certName, cert = (IntPtr)0 };
+
+                    if (ENGINE_ctrl_cmd(engine, "LOAD_CERT_CTRL", 0, ref parms, (IntPtr)0, 1) != 0) {
+                        cert = new X509Certificate2(parms.cert);
+                    } else {
+                        _signCommandApplication.Out.WriteLine("Failed to ENGINE_ctrl_cmd");
+                    }
+
+                    ENGINE_finish(engine);
+                } else {
+                    _signCommandApplication.Out.WriteLine("Failed to ENGINE_init");
+                }
+
+                ENGINE_free(engine);
+            } else {
+                _signCommandApplication.Out.WriteLine("Failed to ENGINE_by_id");
+            }
+
+            return cert;
+        }
+
+        private RSAOpenSsl GetSigningKeyFromPkcs11(string module, string keyName)
+        {
+            RSAOpenSsl key = null;
+
+            // Load openssl/engine
+            try {
+                SafeEvpPKeyHandle yolo = SafeEvpPKeyHandle.OpenPrivateKeyFromEngine("pkcs11", keyName);
+            } catch (Exception) {}
+
+            IntPtr engine = ENGINE_by_id("pkcs11");
+
+            if (engine != (IntPtr)0)
+            {
+                if (ENGINE_init(engine) != 0)
+                {
+                    ENGINE_ctrl_cmd_string(engine, "MODULE_PATH", module, 0);
+
+                    key = new RSAOpenSsl(SafeEvpPKeyHandle.OpenPrivateKeyFromEngine("pkcs11", keyName));
+
+                    ENGINE_finish(engine);
+                } else {
+                    _signCommandApplication.Out.WriteLine("Failed to ENGINE_init");
+                }
+
+                ENGINE_free(engine);
+            } else {
+                _signCommandApplication.Out.WriteLine("Failed to ENGINE_by_id");
+            }
+
+            return key;
         }
     }
 }
