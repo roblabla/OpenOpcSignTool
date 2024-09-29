@@ -13,6 +13,7 @@
     <PackageProjectUrl>https://github.com/vcsjones/OpenOpcSignTool</PackageProjectUrl>
     <RepositoryUrl>https://github.com/vcsjones/OpenOpcSignTool</RepositoryUrl>
     <PublishRepositoryUrl>true</PublishRepositoryUrl>
+    <LangVersion>latest</LangVersion>
   </PropertyGroup>
 
   <ItemGroup Condition="'$(TargetFrameworkIdentifier)' == '.NETFramework'">
