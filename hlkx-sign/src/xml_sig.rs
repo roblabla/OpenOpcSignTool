@@ -305,7 +305,7 @@ fn build_object_xml(
     xml.push_str("<Format>YYYY-MM-DDThh:mm:ss.sTZD</Format>");
     xml.push_str("<Value>");
     // Format matching the C# code: "yyyy-MM-ddTHH:mm:ss.fzzz"
-    xml.push_str(&signing_time.format("%Y-%m-%dT%H:%M:%S%.1f%:z").to_string());
+    xml.push_str(&signing_time.format("%Y-%m-%dT%H:%M:%S.0%:z").to_string());
     xml.push_str("</Value>");
     xml.push_str("</SignatureTime>");
     xml.push_str("</SignatureProperty>");
