@@ -147,12 +147,17 @@ pub enum TransformInfo {
 ///
 /// `signer` is a closure that accepts the canonical `<SignedInfo>` bytes and
 /// returns the RSA PKCS#1 v1.5 signature bytes.
+///
+/// `timestamp_token` is the optional DER-encoded CMS token returned by a TSA.
+/// When present it is base64-encoded and embedded as a second `<Object>` element
+/// matching the format produced by the C# `OpcPackageTimestampBuilder`.
 pub fn build_signature_xml(
     digests: &[PartDigest],
     digest_alg: DigestAlgorithm,
     signing_time: DateTime<FixedOffset>,
     signer: &dyn Fn(&[u8]) -> Result<Vec<u8>>,
-) -> Result<Vec<u8>> {
+    timestamp_token: Option<&[u8]>,
+) -> Result<(Vec<u8>, Vec<u8>)> {
     // ── 1. Build the <Object> element in C14N form ───────────────────────
     let object_xml = build_object_xml(digests, digest_alg, signing_time)?;
 
@@ -195,9 +200,32 @@ pub fn build_signature_xml(
     // canonicalised – it just embeds the same content).
     doc.extend_from_slice(&object_xml);
 
+    // Optional timestamp <Object>, matching the C# OpcPackageTimestampBuilder output:
+    //
+    //   <Object xmlns="http://www.w3.org/2000/09/xmldsig#">
+    //     <mdssi:TimeStamp Id="idSignatureTimestamp"
+    //         xmlns:mdssi="http://schemas.openxmlformats.org/package/2006/digital-signature">
+    //       <mdssi:Comment>Timestamp got from the time stamp server</mdssi:Comment>
+    //       <mdssi:EncodedTime>BASE64</mdssi:EncodedTime>
+    //     </mdssi:TimeStamp>
+    //   </Object>
+    if let Some(token) = timestamp_token {
+        let token_b64 = B64.encode(token);
+        doc.extend_from_slice(b"<Object>");
+        doc.extend_from_slice(b"<mdssi:TimeStamp Id=\"idSignatureTimestamp\" xmlns:mdssi=\"");
+        doc.extend_from_slice(NS_OPC_DSIG.as_bytes());
+        doc.extend_from_slice(b"\">");
+        doc.extend_from_slice(b"<mdssi:Comment>Timestamp got from the time stamp server</mdssi:Comment>");
+        doc.extend_from_slice(b"<mdssi:EncodedTime>");
+        doc.extend_from_slice(token_b64.as_bytes());
+        doc.extend_from_slice(b"</mdssi:EncodedTime>");
+        doc.extend_from_slice(b"</mdssi:TimeStamp>");
+        doc.extend_from_slice(b"</Object>");
+    }
+
     doc.extend_from_slice(b"</Signature>");
 
-    Ok(doc)
+    Ok((doc, sig_bytes))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

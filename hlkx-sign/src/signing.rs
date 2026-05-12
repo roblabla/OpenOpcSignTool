@@ -15,6 +15,7 @@ use crate::opc::{
     MIME_DS_CERTIFICATE, MIME_DS_ORIGIN, MIME_DS_SIGNATURE, MIME_RELS, REL_DS_CERTIFICATE,
     REL_DS_ORIGIN, REL_DS_SIGNATURE,
 };
+use crate::timestamp;
 use crate::xml_sig::{build_signature_xml, DigestAlgorithm, PartDigest, TransformInfo};
 use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
@@ -22,6 +23,19 @@ use chrono::Local;
 use der::Decode;
 use uuid::Uuid;
 use x509_cert::Certificate;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Timestamp configuration
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Optional RFC 3161 timestamp configuration.
+pub struct TimestampConfig<'a> {
+    /// URL of the Time Stamping Authority.
+    pub url: &'a str,
+    /// Hash algorithm to use in the timestamp request (defaults to SHA-256 if
+    /// no explicit selection is made by the caller).
+    pub digest_alg: DigestAlgorithm,
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Public entry-point
@@ -33,12 +47,15 @@ use x509_cert::Certificate;
 /// * `signer`          – closure that signs the canonical `<SignedInfo>` bytes with
 ///                       RSA PKCS#1 v1.5 and returns the raw signature bytes.
 /// * `digest_alg`      – hash algorithm for file digests and the signature.
+/// * `timestamp`       – optional RFC 3161 timestamp configuration; when present,
+///                       the signature value is timestamped and the token embedded.
 /// * `force`           – overwrite an existing signature if one is present.
 pub fn sign(
     pkg: &mut OpcPackage,
     certificate_der: &[u8],
     signer: &dyn Fn(&[u8]) -> Result<Vec<u8>>,
     digest_alg: DigestAlgorithm,
+    timestamp: Option<&TimestampConfig<'_>>,
     force: bool,
 ) -> Result<()> {
     if pkg.has_signatures() && !force {
@@ -164,12 +181,31 @@ pub fn sign(
 
     // ── Step 6: Build the XML signature ───────────────────────────────────
     let signing_time = Local::now().fixed_offset();
-    let sig_xml = build_signature_xml(
+
+    // First build without timestamp token so we can get the signature value.
+    let (mut sig_xml, sig_bytes) = build_signature_xml(
         &all_digests,
         digest_alg,
         signing_time,
         signer,
+        None, // no timestamp yet – we need sig_bytes first
     )?;
+
+    // ── Optional Step 6b: Request timestamp and re-build with token ────────
+    if let Some(ts) = timestamp {
+        eprintln!("Requesting RFC 3161 timestamp from {}...", ts.url);
+        let token = timestamp::request_timestamp(ts.url, &sig_bytes, ts.digest_alg)
+            .context("Timestamp request failed")?;
+
+        // Re-build the XML signature with the timestamp token embedded.
+        (sig_xml, _) = build_signature_xml(
+            &all_digests,
+            digest_alg,
+            signing_time,
+            signer,
+            Some(&token),
+        )?;
+    }
 
     // ── Step 7: Write the signature into the package ──────────────────────
     pkg.set_part(&sig_part_path, sig_xml);
