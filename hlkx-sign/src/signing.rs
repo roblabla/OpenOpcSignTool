@@ -16,12 +16,12 @@ use crate::opc::{
     REL_DS_ORIGIN, REL_DS_SIGNATURE,
 };
 use crate::xml_sig::{build_signature_xml, DigestAlgorithm, PartDigest, TransformInfo};
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use chrono::Local;
-use openssl::pkey::{PKey, Private};
-use openssl::x509::X509;
+use der::Decode;
 use uuid::Uuid;
+use x509_cert::Certificate;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Public entry-point
@@ -29,14 +29,15 @@ use uuid::Uuid;
 
 /// Sign the OPC package at `pkg`.
 ///
-/// * `certificate` – the signing certificate (embedded in the package).
-/// * `private_key` – RSA private key for producing the signature.
-/// * `digest_alg`  – hash algorithm for file digests and the signature.
-/// * `force`       – overwrite an existing signature if one is present.
+/// * `certificate_der` – DER-encoded signing certificate (embedded in the package).
+/// * `signer`          – closure that signs the canonical `<SignedInfo>` bytes with
+///                       RSA PKCS#1 v1.5 and returns the raw signature bytes.
+/// * `digest_alg`      – hash algorithm for file digests and the signature.
+/// * `force`           – overwrite an existing signature if one is present.
 pub fn sign(
     pkg: &mut OpcPackage,
-    certificate: &X509,
-    private_key: &PKey<Private>,
+    certificate_der: &[u8],
+    signer: &dyn Fn(&[u8]) -> Result<Vec<u8>>,
     digest_alg: DigestAlgorithm,
     force: bool,
 ) -> Result<()> {
@@ -46,7 +47,7 @@ pub fn sign(
 
     // ── Step 1: Choose file names for the new signature artefacts ─────────
     let sig_filename = format!("{}.psdsxs", Uuid::new_v4().as_simple());
-    let cert_filename = cert_der_filename(certificate)?;
+    let cert_filename = cert_der_filename(certificate_der)?;
 
     let origin_part_path = "package/services/digital-signature/origin.psdsor";
     let sig_part_path = format!(
@@ -100,8 +101,7 @@ pub fn sign(
     pkg.entries.insert(origin_rels_path, serialize_rels(&origin_rel_list));
 
     // Certificate part (DER bytes).
-    let cert_der = certificate.to_der()?;
-    pkg.set_part(&cert_part_path, cert_der);
+    pkg.set_part(&cert_part_path, certificate_der.to_vec());
 
     // Signature → certificate relationship.
     let sig_rels_path = rels_path_for_part(&sig_part_path);
@@ -166,10 +166,9 @@ pub fn sign(
     let signing_time = Local::now().fixed_offset();
     let sig_xml = build_signature_xml(
         &all_digests,
-        certificate,
-        private_key,
         digest_alg,
         signing_time,
+        signer,
     )?;
 
     // ── Step 7: Write the signature into the package ──────────────────────
@@ -291,11 +290,12 @@ fn build_filtered_rels_xml(rels: &[&OpcRelationship]) -> String {
 
 /// Compute the certificate file name: serial number bytes reversed, hex-encoded.
 /// Matches the C# `ByteArrayToReverseString(certificate.GetSerialNumber())`.
-fn cert_der_filename(cert: &X509) -> Result<String> {
-    // GetSerialNumber() returns the DER big-endian bytes of the serial number.
-    // The C# code reverses them to get a little-endian hex string.
-    let serial = cert.serial_number().to_bn()?;
-    let bytes = serial.to_vec();
+fn cert_der_filename(cert_der: &[u8]) -> Result<String> {
+    // Parse the DER certificate to extract the serial number.
+    let cert = Certificate::from_der(cert_der)
+        .context("Failed to parse certificate DER")?;
+    // serial_number().as_bytes() returns the big-endian integer content bytes.
+    let bytes = cert.tbs_certificate.serial_number.as_bytes();
     let reversed: Vec<u8> = bytes.iter().rev().cloned().collect();
     let hex_str = hex::encode_upper(&reversed);
     Ok(format!("{}.cer", hex_str))

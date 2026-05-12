@@ -1,171 +1,171 @@
-//! Load a private key and X.509 certificate from a PKCS#11 token via the
-//! OpenSSL `pkcs11` ENGINE.
+//! Load a certificate and sign data using a PKCS#11 token via the `cryptoki` crate.
 //!
-//! This mirrors the C# code that calls:
-//!   ENGINE_by_id("pkcs11")
-//!   ENGINE_init
-//!   ENGINE_ctrl_cmd_string("MODULE_PATH", module)
-//!   ENGINE_load_private_key(engine, key_id)
-//!   ENGINE_ctrl_cmd("LOAD_CERT_CTRL", 0, &parms)   → X509*
+//! This replaces the previous OpenSSL ENGINE-based implementation with a pure
+//! Rust, safe API that talks directly to the PKCS#11 library.
 
+use crate::xml_sig::DigestAlgorithm;
 use anyhow::{bail, Context, Result};
-use foreign_types::ForeignType;
-use openssl::pkey::{PKey, Private};
-use openssl::x509::X509;
-use std::ffi::CString;
-use std::os::raw::{c_char, c_int, c_long, c_void};
-use std::ptr;
+use cryptoki::{
+    context::{CInitializeArgs, CInitializeFlags, Pkcs11},
+    mechanism::Mechanism,
+    object::{Attribute, AttributeType, ObjectClass},
+    session::UserType,
+    types::AuthPin,
+};
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Raw OpenSSL ENGINE FFI
+// Helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Opaque ENGINE type.
-#[repr(C)]
-struct ENGINE {
-    _private: [u8; 0],
+/// Extract the `object=` component from a PKCS#11 URI, or return `id` as-is.
+///
+/// PKCS#11 URIs (RFC 7512) look like:
+/// `pkcs11:token=MyToken;object=MyCert;type=cert`
+/// Plain labels (e.g. `"MyCert"`) are accepted unchanged.
+fn extract_label(id: &str) -> &str {
+    if let Some(rest) = id.strip_prefix("pkcs11:") {
+        for part in rest.split(';') {
+            if let Some(val) = part.strip_prefix("object=") {
+                return val;
+            }
+        }
+        // URI present but no object= component – fall through to return full id.
+    }
+    id
 }
 
-// UI_METHOD opaque type.
-#[repr(C)]
-struct UI_METHOD {
-    _private: [u8; 0],
-}
-
-/// Parameter struct for `LOAD_CERT_CTRL`.
-#[repr(C)]
-struct LoadCertCtrlArgs {
-    id: *const c_char,
-    cert: *mut c_void, // X509 *
-}
-
-#[link(name = "crypto")]
-extern "C" {
-    fn ENGINE_by_id(id: *const c_char) -> *mut ENGINE;
-    fn ENGINE_init(e: *mut ENGINE) -> c_int;
-    fn ENGINE_finish(e: *mut ENGINE) -> c_int;
-    fn ENGINE_free(e: *mut ENGINE) -> c_int;
-    fn ENGINE_ctrl_cmd_string(
-        e: *mut ENGINE,
-        cmd_name: *const c_char,
-        arg: *const c_char,
-        cmd_optional: c_int,
-    ) -> c_int;
-    fn ENGINE_ctrl_cmd(
-        e: *mut ENGINE,
-        cmd_name: *const c_char,
-        i: c_long,
-        p: *mut c_void,
-        f: *const c_void,
-        cmd_optional: c_int,
-    ) -> c_int;
-    fn ENGINE_load_private_key(
-        e: *mut ENGINE,
-        key_id: *const c_char,
-        ui_method: *mut UI_METHOD,
-        callback_data: *mut c_void,
-    ) -> *mut c_void; // EVP_PKEY *
+/// Map a `DigestAlgorithm` to the combined RSA PKCS#1 v1.5 + hash PKCS#11 mechanism.
+fn rsa_pkcs1_mechanism(digest_alg: DigestAlgorithm) -> Mechanism<'static> {
+    match digest_alg {
+        DigestAlgorithm::Sha1 => Mechanism::Sha1RsaPkcs,
+        DigestAlgorithm::Sha256 => Mechanism::Sha256RsaPkcs,
+        DigestAlgorithm::Sha384 => Mechanism::Sha384RsaPkcs,
+        DigestAlgorithm::Sha512 => Mechanism::Sha512RsaPkcs,
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Public API
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Load a private key from a PKCS#11 token via the OpenSSL `pkcs11` engine.
+/// Load the DER-encoded bytes of a certificate from the PKCS#11 token.
 ///
-/// `module` is the path to the PKCS#11 shared library (e.g.
-/// `/usr/lib/opensc-pkcs11.so`).  `key_id` is the PKCS#11 key identifier
-/// string (e.g. `"pkcs11:type=private;object=my-key"`).
-pub fn load_private_key(module: &str, key_id: &str) -> Result<PKey<Private>> {
-    let engine_id = CString::new("pkcs11").unwrap();
-    let module_path_cmd = CString::new("MODULE_PATH").unwrap();
-    let module_c = CString::new(module).context("module path contains NUL byte")?;
-    let key_id_c = CString::new(key_id).context("key_id contains NUL byte")?;
+/// * `module`  – path to the PKCS#11 shared library.
+/// * `cert_id` – PKCS#11 URI (RFC 7512) or plain label of the certificate object.
+/// * `pin`     – optional user PIN for logging in; pass `None` if the token
+///               does not require authentication.
+pub fn load_certificate_der(module: &str, cert_id: &str, pin: Option<&str>) -> Result<Vec<u8>> {
+    let label = extract_label(cert_id);
 
-    unsafe {
-        let engine = ENGINE_by_id(engine_id.as_ptr());
-        if engine.is_null() {
-            bail!("ENGINE_by_id(\"pkcs11\") failed – is libengine-pkcs11-openssl installed?");
-        }
+    let pkcs11 = Pkcs11::new(module).context("Failed to load PKCS#11 module")?;
+    pkcs11
+        .initialize(CInitializeArgs::new(CInitializeFlags::OS_LOCKING_OK))
+        .context("Failed to initialize PKCS#11")?;
 
-        // Set module path before init so the engine knows which PKCS#11 library
-        // to load.  `cmd_optional = 1` means: do not error if the command is
-        // not supported before init.
-        ENGINE_ctrl_cmd_string(engine, module_path_cmd.as_ptr(), module_c.as_ptr(), 1);
+    let slots = pkcs11
+        .get_slots_with_initialized_token()
+        .context("Failed to get PKCS#11 slots")?;
 
-        if ENGINE_init(engine) == 0 {
-            ENGINE_free(engine);
-            bail!("ENGINE_init failed for pkcs11 engine");
-        }
-
-        // Also set MODULE_PATH after init (some engine versions require this).
-        ENGINE_ctrl_cmd_string(engine, module_path_cmd.as_ptr(), module_c.as_ptr(), 0);
-
-        let evp_pkey =
-            ENGINE_load_private_key(engine, key_id_c.as_ptr(), ptr::null_mut(), ptr::null_mut());
-
-        ENGINE_finish(engine);
-        ENGINE_free(engine);
-
-        if evp_pkey.is_null() {
-            bail!("ENGINE_load_private_key failed – check key_id \"{}\"", key_id);
-        }
-
-        // Wrap the raw EVP_PKEY* in an openssl PKey.
-        // Safety: `evp_pkey` is a valid, owned EVP_PKEY* returned by OpenSSL.
-        let pkey = PKey::from_ptr(evp_pkey as *mut _);
-        Ok(pkey)
+    if slots.is_empty() {
+        bail!("No initialized PKCS#11 token found");
     }
+
+    for slot in slots {
+        let session = pkcs11
+            .open_ro_session(slot)
+            .context("Failed to open PKCS#11 session")?;
+
+        if let Some(p) = pin {
+            session
+                .login(UserType::User, Some(&AuthPin::new(Box::from(p))))
+                .context("PKCS#11 login failed")?;
+        }
+
+        let search = vec![
+            Attribute::Class(ObjectClass::CERTIFICATE),
+            Attribute::Label(label.as_bytes().to_vec()),
+        ];
+        let handles = session
+            .find_objects(&search)
+            .context("PKCS#11 find_objects failed")?;
+
+        for handle in handles {
+            let attrs = session
+                .get_attributes(handle, &[AttributeType::Value])
+                .context("PKCS#11 get_attributes failed")?;
+            for attr in attrs {
+                if let Attribute::Value(der) = attr {
+                    if !der.is_empty() {
+                        return Ok(der);
+                    }
+                }
+            }
+        }
+    }
+
+    bail!("Certificate '{}' not found on any PKCS#11 slot", cert_id)
 }
 
-/// Load an X.509 certificate from a PKCS#11 token via the OpenSSL `pkcs11`
-/// engine using the `LOAD_CERT_CTRL` control command.
-pub fn load_certificate(module: &str, cert_id: &str) -> Result<X509> {
-    let engine_id = CString::new("pkcs11").unwrap();
-    let module_path_cmd = CString::new("MODULE_PATH").unwrap();
-    let load_cert_ctrl = CString::new("LOAD_CERT_CTRL").unwrap();
-    let module_c = CString::new(module).context("module path contains NUL byte")?;
-    let cert_id_c = CString::new(cert_id).context("cert_id contains NUL byte")?;
+/// Sign `data` with the private key identified by `key_id` on the PKCS#11 token.
+///
+/// Uses the combined hash-and-sign RSA PKCS#1 v1.5 mechanism (e.g.
+/// `CKM_SHA256_RSA_PKCS`) so the hash is computed on the token.
+///
+/// * `module`     – path to the PKCS#11 shared library.
+/// * `key_id`     – PKCS#11 URI (RFC 7512) or plain label of the private key.
+/// * `digest_alg` – selects the hash algorithm embedded in the mechanism.
+/// * `pin`        – optional user PIN; pass `None` if the token does not require it.
+/// * `data`       – the raw bytes to sign (the canonical `<SignedInfo>` XML).
+pub fn pkcs11_sign(
+    module: &str,
+    key_id: &str,
+    digest_alg: DigestAlgorithm,
+    pin: Option<&str>,
+    data: &[u8],
+) -> Result<Vec<u8>> {
+    let label = extract_label(key_id);
+    let mechanism = rsa_pkcs1_mechanism(digest_alg);
 
-    unsafe {
-        let engine = ENGINE_by_id(engine_id.as_ptr());
-        if engine.is_null() {
-            bail!("ENGINE_by_id(\"pkcs11\") failed – is libengine-pkcs11-openssl installed?");
-        }
+    let pkcs11 = Pkcs11::new(module).context("Failed to load PKCS#11 module")?;
+    pkcs11
+        .initialize(CInitializeArgs::new(CInitializeFlags::OS_LOCKING_OK))
+        .context("Failed to initialize PKCS#11")?;
 
-        ENGINE_ctrl_cmd_string(engine, module_path_cmd.as_ptr(), module_c.as_ptr(), 1);
+    let slots = pkcs11
+        .get_slots_with_initialized_token()
+        .context("Failed to get PKCS#11 slots")?;
 
-        if ENGINE_init(engine) == 0 {
-            ENGINE_free(engine);
-            bail!("ENGINE_init failed for pkcs11 engine");
-        }
-
-        ENGINE_ctrl_cmd_string(engine, module_path_cmd.as_ptr(), module_c.as_ptr(), 0);
-
-        let mut args = LoadCertCtrlArgs {
-            id: cert_id_c.as_ptr(),
-            cert: ptr::null_mut(),
-        };
-
-        let rc = ENGINE_ctrl_cmd(
-            engine,
-            load_cert_ctrl.as_ptr(),
-            0,
-            &mut args as *mut _ as *mut c_void,
-            ptr::null(),
-            1,
-        );
-
-        ENGINE_finish(engine);
-        ENGINE_free(engine);
-
-        if rc == 0 || args.cert.is_null() {
-            bail!("LOAD_CERT_CTRL failed – check cert_id \"{}\"", cert_id);
-        }
-
-        // Wrap the raw X509* in an openssl X509.
-        // Safety: `args.cert` is a valid, owned X509* returned by OpenSSL.
-        let x509 = X509::from_ptr(args.cert as *mut _);
-        Ok(x509)
+    if slots.is_empty() {
+        bail!("No initialized PKCS#11 token found");
     }
+
+    for slot in slots {
+        // Signing may require a read-write session on some tokens.
+        let session = pkcs11
+            .open_rw_session(slot)
+            .context("Failed to open PKCS#11 session")?;
+
+        if let Some(p) = pin {
+            session
+                .login(UserType::User, Some(&AuthPin::new(Box::from(p))))
+                .context("PKCS#11 login failed")?;
+        }
+
+        let search = vec![
+            Attribute::Class(ObjectClass::PRIVATE_KEY),
+            Attribute::Label(label.as_bytes().to_vec()),
+        ];
+        let handles = session
+            .find_objects(&search)
+            .context("PKCS#11 find_objects failed")?;
+
+        if let Some(&key_handle) = handles.first() {
+            let sig = session
+                .sign(&mechanism, key_handle, data)
+                .context("PKCS#11 sign failed")?;
+            return Ok(sig);
+        }
+    }
+
+    bail!("Private key '{}' not found on any PKCS#11 slot", key_id)
 }

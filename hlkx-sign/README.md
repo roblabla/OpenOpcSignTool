@@ -1,17 +1,15 @@
 # hlkx-sign
 
-A Rust tool to sign HLKX (and VSIX) packages using a PKCS#11 module and
-OpenSSL.  It produces an OPC digital signature that is compatible with the
-signatures created by the C# `OpenVsixSignTool`.
+A Rust tool to sign HLKX (and VSIX) OPC packages using a PKCS#11 module.
+
+It uses the [`cryptoki`](https://crates.io/crates/cryptoki) crate to talk
+directly to the PKCS#11 library — **no OpenSSL dependency**.
 
 ## Requirements
 
-* **OpenSSL 3.x** with the PKCS#11 engine support.  On Debian/Ubuntu:
-  ```
-  apt install libssl-dev libengine-pkcs11-openssl
-  ```
-* A PKCS#11 module (`.so`) for your hardware token or software HSM (e.g.
-  OpenSC: `/usr/lib/x86_64-linux-gnu/opensc-pkcs11.so`).
+* A PKCS#11 shared library for your hardware token or software HSM, e.g.:
+  * OpenSC: `/usr/lib/x86_64-linux-gnu/opensc-pkcs11.so`
+  * SoftHSM2: `/usr/lib/softhsm/libsofthsm2.so`
 
 ## Building
 
@@ -28,6 +26,7 @@ hlkx-sign sign \
   --pkcs11-module /usr/lib/x86_64-linux-gnu/opensc-pkcs11.so \
   --pkcs11-cert  "pkcs11:token=MyToken;type=cert;object=MyCert" \
   --pkcs11-key   "pkcs11:token=MyToken;type=private;object=MyCert" \
+  [--pkcs11-pin 1234] \
   [--file-digest sha256] \
   [--force] \
   path/to/package.hlkx
@@ -38,10 +37,23 @@ hlkx-sign sign \
 | Flag | Description | Default |
 |------|-------------|---------|
 | `--pkcs11-module` | Path to the PKCS#11 shared library | *(required)* |
-| `--pkcs11-cert` | PKCS#11 URI or key ID for the certificate | *(required)* |
-| `--pkcs11-key` | PKCS#11 URI or key ID for the private key | *(required)* |
-| `--file-digest` | Hash algorithm (`sha1`, `sha256`, `sha384`, `sha512`) | `sha256` |
+| `--pkcs11-cert` | PKCS#11 URI (`pkcs11:…;object=Label`) or plain CKA_LABEL | *(required)* |
+| `--pkcs11-key` | PKCS#11 URI (`pkcs11:…;object=Label`) or plain CKA_LABEL | *(required)* |
+| `--pkcs11-pin` | User PIN for the token (optional) | none |
+| `--file-digest` | Hash algorithm: `sha1`, `sha256`, `sha384`, `sha512` | `sha256` |
 | `--force` / `-f` | Overwrite an existing signature | off |
+
+### Object identification
+
+`--pkcs11-cert` and `--pkcs11-key` accept either a PKCS#11 URI (RFC 7512)
+with an `object=` component, or a plain object label (`CKA_LABEL`).  All
+initialized slots are searched in order.
+
+Examples:
+```
+--pkcs11-cert "pkcs11:token=MyHSM;type=cert;object=CodeSigningCert"
+--pkcs11-key  CodeSigningCert          # plain label
+```
 
 ## How it works
 
@@ -55,8 +67,9 @@ hlkx-sign sign \
 4. An XML digital signature is built following ECMA-376 Part 2 §13:
    * `<Object>` containing the manifest and a `<SignatureTime>` property is
      C14N-hashed and referenced from `<SignedInfo>`.
-   * The canonical `<SignedInfo>` bytes are signed with RSA PKCS#1 v1.5 via the
-     PKCS#11 key.
+   * The canonical `<SignedInfo>` bytes are sent to the PKCS#11 token which
+     computes the hash and produces an RSA PKCS#1 v1.5 signature in one
+     operation (`CKM_SHA256_RSA_PKCS` etc.).
 5. The signature XML is written to
    `package/services/digital-signature/xml-signature/<uuid>.psdsxs`.
 6. The DER-encoded certificate is written to

@@ -8,10 +8,6 @@ use crate::opc::xml_escape_attr;
 use anyhow::Result;
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use chrono::{DateTime, FixedOffset};
-use openssl::hash::MessageDigest;
-use openssl::pkey::{PKey, Private};
-use openssl::sign::Signer;
-use openssl::x509::X509;
 use sha1::Digest as Sha1Digest;
 use sha2::Digest as Sha2Digest;
 
@@ -109,16 +105,6 @@ impl DigestAlgorithm {
             }
         }
     }
-
-    /// The OpenSSL MessageDigest for signing.
-    pub fn message_digest(&self) -> MessageDigest {
-        match self {
-            Self::Sha1 => MessageDigest::sha1(),
-            Self::Sha256 => MessageDigest::sha256(),
-            Self::Sha384 => MessageDigest::sha384(),
-            Self::Sha512 => MessageDigest::sha512(),
-        }
-    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -158,12 +144,14 @@ pub enum TransformInfo {
 /// Note: the certificate is stored in a separate `.cer` part linked via a
 /// relationship; it is not embedded in the KeyInfo element (the C# reference
 /// implementation leaves KeyInfo commented out).
+///
+/// `signer` is a closure that accepts the canonical `<SignedInfo>` bytes and
+/// returns the RSA PKCS#1 v1.5 signature bytes.
 pub fn build_signature_xml(
     digests: &[PartDigest],
-    _certificate: &X509,
-    private_key: &PKey<Private>,
     digest_alg: DigestAlgorithm,
     signing_time: DateTime<FixedOffset>,
+    signer: &dyn Fn(&[u8]) -> Result<Vec<u8>>,
 ) -> Result<Vec<u8>> {
     // ── 1. Build the <Object> element in C14N form ───────────────────────
     let object_xml = build_object_xml(digests, digest_alg, signing_time)?;
@@ -177,7 +165,7 @@ pub fn build_signature_xml(
         build_signed_info_xml(&object_hash_b64, digest_alg)?;
 
     // Sign the canonical SignedInfo bytes.
-    let sig_bytes = rsa_pkcs1_sign(&signed_info_xml, private_key, digest_alg)?;
+    let sig_bytes = signer(&signed_info_xml)?;
     let sig_b64 = B64.encode(&sig_bytes);
 
     // ── 4. Assemble the full <Signature> document ─────────────────────────
@@ -348,21 +336,4 @@ fn build_signed_info_inner_str(object_hash_b64: &str, digest_alg: DigestAlgorith
     s.push_str("</DigestValue>");
     s.push_str("</Reference>");
     s
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// RSA PKCS#1 signing
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Sign `data` with RSA PKCS#1 v1.5 using the given digest algorithm.
-fn rsa_pkcs1_sign(
-    data: &[u8],
-    key: &PKey<Private>,
-    digest_alg: DigestAlgorithm,
-) -> Result<Vec<u8>> {
-    let md = digest_alg.message_digest();
-    let mut signer = Signer::new(md, key)?;
-    signer.update(data)?;
-    let sig = signer.sign_to_vec()?;
-    Ok(sig)
 }
