@@ -330,7 +330,7 @@ impl OpcPackage {
         {
             let mut writer = zip::ZipWriter::new(tmp.as_file());
             let options = zip::write::SimpleFileOptions::default()
-                .compression_method(zip::CompressionMethod::Stored);
+                .compression_method(zip::CompressionMethod::Deflated);
 
             // Write every entry (sorted for determinism, content-types last).
             let mut names: Vec<&String> = self.entries.keys().collect();
