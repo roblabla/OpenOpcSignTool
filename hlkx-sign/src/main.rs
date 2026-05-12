@@ -3,14 +3,17 @@
 //! Usage:
 //!   hlkx-sign sign \
 //!     --pkcs11-module /usr/lib/opensc-pkcs11.so \
-//!     --pkcs11-cert "pkcs11:type=cert;object=MyCert" \
-//!     --pkcs11-key  "pkcs11:type=private;object=MyCert" \
-//!     [--pkcs11-pin 1234] \
+//!     --pkcs11-cert "pkcs11:token=MyToken;object=MyCert;type=cert" \
+//!     --pkcs11-key  "pkcs11:token=MyToken;object=MyCert;type=private;pin-value=1234" \
 //!     [--file-digest sha256] \
 //!     [--timestamp http://timestamp.example.com/] \
 //!     [--timestamp-algorithm sha256] \
 //!     [--force] \
 //!     package.hlkx
+//!
+//! The PIN is read from the `pin-value=` field of the PKCS#11 URI (same
+//! convention as OpenSSL's engine_pkcs11).  There is no separate `--pkcs11-pin`
+//! argument.
 
 mod c14n;
 mod opc;
@@ -42,16 +45,20 @@ enum Commands {
         pkcs11_module: String,
 
         /// PKCS#11 URI or object label for the certificate.
-        #[arg(long, value_name = "ID")]
+        ///
+        /// Supported URI fields: token=, object=, type=, pin-value=
+        /// Example: "pkcs11:token=MyToken;object=MyCert;type=cert"
+        #[arg(long, value_name = "URI")]
         pkcs11_cert: String,
 
         /// PKCS#11 URI or object label for the private key.
-        #[arg(long, value_name = "ID")]
+        ///
+        /// Supported URI fields: token=, object=, type=, pin-value=
+        /// Example: "pkcs11:token=MyToken;object=MyKey;type=private;pin-value=1234"
+        ///
+        /// The PIN is extracted from the pin-value= field of this URI.
+        #[arg(long, value_name = "URI")]
         pkcs11_key: String,
-
-        /// Optional user PIN for the PKCS#11 token.
-        #[arg(long, value_name = "PIN")]
-        pkcs11_pin: Option<String>,
 
         /// Digest algorithm: sha1 | sha256 | sha384 | sha512 (default: sha256).
         #[arg(long, value_name = "ALGORITHM", default_value = "sha256")]
@@ -95,7 +102,6 @@ fn run() -> anyhow::Result<()> {
             pkcs11_module,
             pkcs11_cert,
             pkcs11_key,
-            pkcs11_pin,
             file_digest,
             timestamp,
             timestamp_algorithm,
@@ -129,26 +135,16 @@ fn run() -> anyhow::Result<()> {
                 anyhow::bail!("file not found: {}", file);
             }
 
-            let pin = pkcs11_pin.as_deref();
-
             eprintln!("Loading certificate from PKCS#11 token...");
-            let cert_der =
-                pkcs11::load_certificate_der(&pkcs11_module, &pkcs11_cert, pin)?;
+            let cert_der = pkcs11::load_certificate_der(&pkcs11_module, &pkcs11_cert)?;
 
-            // Build a signing closure that will be called once or twice
-            // (with and without timestamp token) to sign SignedInfo.
+            // Build a signing closure. The PIN is embedded in the key URI's
+            // pin-value= field and extracted inside pkcs11_sign.
             let signer = {
                 let module = pkcs11_module.clone();
                 let key = pkcs11_key.clone();
-                let pin_owned = pkcs11_pin.clone();
                 move |data: &[u8]| {
-                    pkcs11::pkcs11_sign(
-                        &module,
-                        &key,
-                        digest_alg,
-                        pin_owned.as_deref(),
-                        data,
-                    )
+                    pkcs11::pkcs11_sign(&module, &key, digest_alg, data)
                 }
             };
 
