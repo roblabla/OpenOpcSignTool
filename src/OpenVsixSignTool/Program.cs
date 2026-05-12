@@ -28,6 +28,7 @@ namespace OpenVsixSignTool
                     var pkcs11Module = signConfiguration.Option("--pkcs11-module", "Path to the PKCS11 module to use.", CommandOptionType.SingleValue);
                     var pkcs11Cert = signConfiguration.Option("--pkcs11-cert", "Name of the PKCS11 object representing the certificate to use.", CommandOptionType.SingleValue);
                     var pkcs11Key = signConfiguration.Option("--pkcs11-key", "Name of the PKCS11 object representing the private key to use.", CommandOptionType.SingleValue);
+                    var pkcs11Token = signConfiguration.Option("--pkcs11-token", "The label of the PKCS11 token to use.", CommandOptionType.SingleValue);
 
                     signConfiguration.OnExecute(() =>
                     {
@@ -38,7 +39,7 @@ namespace OpenVsixSignTool
                         }
                         else if (pkcs11Module.HasValue() || pkcs11Cert.HasValue() || pkcs11Key.HasValue())
                         {
-                            return sign.SignPkcs11(pkcs11Module, pkcs11Cert, pkcs11Key, timestamp, timestampAlgorithm, fileDigest, force, file);
+                            return sign.SignPkcs11(pkcs11Module, pkcs11Cert, pkcs11Key, pkcs11Token, timestamp, timestampAlgorithm, fileDigest, force, file);
                         }
                         else
                         {
