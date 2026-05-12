@@ -262,11 +262,13 @@ pub fn request_timestamp(
     // Hash the signature value.
     let digest = digest_alg.hash(signature_value);
 
-    // Generate a random 64-bit nonce.  Clear the MSB to ensure the value
-    // encodes as a positive DER INTEGER (some TSAs reject negative nonces).
+    // Generate a random 64-bit nonce.  Clear the MSB of the first byte so
+    // the value encodes as a positive DER INTEGER (some TSAs reject negative
+    // nonces).
     let nonce: u64 = {
-        let bytes: [u8; 8] = uuid::Uuid::new_v4().as_bytes()[..8].try_into().unwrap();
-        u64::from_be_bytes(bytes) & !(1u64 << 63)
+        let mut bytes: [u8; 8] = uuid::Uuid::new_v4().as_bytes()[..8].try_into().unwrap();
+        bytes[0] &= 0x7F;
+        u64::from_be_bytes(bytes)
     };
 
     let ts_req = encode_timestamp_req(&digest, digest_alg, nonce);

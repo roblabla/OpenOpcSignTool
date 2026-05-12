@@ -25,9 +25,10 @@ The resulting binary is at `target/release/hlkx-sign`.
 hlkx-sign sign \
   --pkcs11-module /usr/lib/x86_64-linux-gnu/opensc-pkcs11.so \
   --pkcs11-cert  "pkcs11:token=MyToken;type=cert;object=MyCert" \
-  --pkcs11-key   "pkcs11:token=MyToken;type=private;object=MyCert" \
-  [--pkcs11-pin 1234] \
+  --pkcs11-key   "pkcs11:token=MyToken;type=private;object=MyCert;pin-value=1234" \
   [--file-digest sha256] \
+  [--timestamp http://timestamp.example.com/] \
+  [--timestamp-algorithm sha256] \
   [--force] \
   path/to/package.hlkx
 ```
@@ -38,21 +39,29 @@ hlkx-sign sign \
 |------|-------------|---------|
 | `--pkcs11-module` | Path to the PKCS#11 shared library | *(required)* |
 | `--pkcs11-cert` | PKCS#11 URI (`pkcs11:…;object=Label`) or plain CKA_LABEL | *(required)* |
-| `--pkcs11-key` | PKCS#11 URI (`pkcs11:…;object=Label`) or plain CKA_LABEL | *(required)* |
-| `--pkcs11-pin` | User PIN for the token (optional) | none |
+| `--pkcs11-key` | PKCS#11 URI (`pkcs11:…;object=Label;pin-value=PIN`) or plain CKA_LABEL | *(required)* |
 | `--file-digest` | Hash algorithm: `sha1`, `sha256`, `sha384`, `sha512` | `sha256` |
+| `--timestamp` | URL of a RFC 3161 Time Stamping Authority | none |
+| `--timestamp-algorithm` | Hash algorithm for the timestamp request | `sha256` |
 | `--force` / `-f` | Overwrite an existing signature | off |
 
 ### Object identification
 
 `--pkcs11-cert` and `--pkcs11-key` accept either a PKCS#11 URI (RFC 7512)
-with an `object=` component, or a plain object label (`CKA_LABEL`).  All
-initialized slots are searched in order.
+with an `object=` component, or a plain object label (`CKA_LABEL`).
+
+When a `token=` component is present in the URI, only slots whose token
+label matches are searched — preventing accidental login to the wrong token.
+
+The PIN is supplied via the `pin-value=` field of the `--pkcs11-key` URI
+(same convention as OpenSSL's `engine_pkcs11`).  If omitted, no login is
+attempted.
 
 Examples:
 ```
 --pkcs11-cert "pkcs11:token=MyHSM;type=cert;object=CodeSigningCert"
---pkcs11-key  CodeSigningCert          # plain label
+--pkcs11-key  "pkcs11:token=MyHSM;type=private;object=CodeSigningCert;pin-value=1234"
+--pkcs11-key  CodeSigningCert          # plain label, no PIN
 ```
 
 ## How it works
