@@ -28,8 +28,8 @@ fn der_tlv(tag: u8, value: &[u8]) -> Vec<u8> {
         out.push((len >> 8) as u8);
         out.push(len as u8);
     } else {
-        // Values > 64 KiB are not expected here.
-        panic!("DER value too long");
+        // Values > 64 KiB are not expected in a timestamp request/response.
+        panic!("DER value too long: {} bytes (maximum 65535)", len);
     }
     out.extend_from_slice(value);
     out
@@ -262,11 +262,11 @@ pub fn request_timestamp(
     // Hash the signature value.
     let digest = digest_alg.hash(signature_value);
 
-    // Generate a random 64-bit nonce.
+    // Generate a random 64-bit nonce.  Clear the MSB to ensure the value
+    // encodes as a positive DER INTEGER (some TSAs reject negative nonces).
     let nonce: u64 = {
-        let bytes = uuid::Uuid::new_v4().as_bytes()[..8].try_into().unwrap();
-        // Clear the sign bit so the nonce is a positive INTEGER.
-        u64::from_be_bytes(bytes) & 0x7FFF_FFFF_FFFF_FFFF
+        let bytes: [u8; 8] = uuid::Uuid::new_v4().as_bytes()[..8].try_into().unwrap();
+        u64::from_be_bytes(bytes) & !(1u64 << 63)
     };
 
     let ts_req = encode_timestamp_req(&digest, digest_alg, nonce);

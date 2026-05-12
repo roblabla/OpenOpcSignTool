@@ -193,7 +193,7 @@ pub fn sign(
 
     // ── Optional Step 6b: Request timestamp and re-build with token ────────
     if let Some(ts) = timestamp {
-        eprintln!("Requesting RFC 3161 timestamp from {}...", ts.url);
+        eprintln!("Requesting RFC 3161 timestamp...");
         let token = timestamp::request_timestamp(ts.url, &sig_bytes, ts.digest_alg)
             .context("Timestamp request failed")?;
 
