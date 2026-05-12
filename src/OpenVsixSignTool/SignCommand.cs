@@ -122,6 +122,7 @@ namespace OpenVsixSignTool
             CommandOption pkcs11Module,
             CommandOption pkcs11Cert,
             CommandOption pkcs11Key,
+            CommandOption pkcs11Token,
             CommandOption timestampUrl,
             CommandOption timestampAlgorithm,
             CommandOption fileDigest,
@@ -179,14 +180,15 @@ namespace OpenVsixSignTool
                 timestampDigestAlgorithm = timestampDigestResult.Value;
             }
 
-            RSAOpenSsl key = GetSigningKeyFromPkcs11(pkcs11Module.Value(), pkcs11Key.Value());
+            var tokenLabel = pkcs11Token.HasValue() ? pkcs11Token.Value() : null;
+            RSAOpenSsl key = GetSigningKeyFromPkcs11(pkcs11Module.Value(), pkcs11Key.Value(), tokenLabel);
             if (key == null)
             {
                 _signCommandApplication.Out.WriteLine("Unable to locate key on token.");
                 return Task.FromResult(EXIT_CODES.FAILED);
             }
 
-            X509Certificate2 certificate = GetCertificateFromPkcs11(pkcs11Cert.Value());
+            X509Certificate2 certificate = GetCertificateFromPkcs11(pkcs11Cert.Value(), tokenLabel);
             if (certificate == null)
             {
                 _signCommandApplication.Out.WriteLine("Unable to locate certificate on token.");
@@ -432,7 +434,7 @@ namespace OpenVsixSignTool
             public IntPtr cert; // X509*
         }
 
-        private X509Certificate2 GetCertificateFromPkcs11(string certName)
+        private X509Certificate2 GetCertificateFromPkcs11(string certName, string tokenLabel)
         {
             IntPtr engine = ENGINE_by_id("pkcs11");
             X509Certificate2 cert = null;
@@ -441,6 +443,11 @@ namespace OpenVsixSignTool
             {
                 if (ENGINE_init(engine) != 0)
                 {
+                    if (tokenLabel != null)
+                    {
+                        ENGINE_ctrl_cmd_string(engine, "TOKEN_LABEL", tokenLabel, 0);
+                    }
+
                     Parms parms = new Parms { id = certName, cert = (IntPtr)0 };
 
                     if (ENGINE_ctrl_cmd(engine, "LOAD_CERT_CTRL", 0, ref parms, (IntPtr)0, 1) != 0) {
@@ -462,7 +469,7 @@ namespace OpenVsixSignTool
             return cert;
         }
 
-        private RSAOpenSsl GetSigningKeyFromPkcs11(string module, string keyName)
+        private RSAOpenSsl GetSigningKeyFromPkcs11(string module, string keyName, string tokenLabel)
         {
             RSAOpenSsl key = null;
 
@@ -478,6 +485,11 @@ namespace OpenVsixSignTool
                 if (ENGINE_init(engine) != 0)
                 {
                     ENGINE_ctrl_cmd_string(engine, "MODULE_PATH", module, 0);
+
+                    if (tokenLabel != null)
+                    {
+                        ENGINE_ctrl_cmd_string(engine, "TOKEN_LABEL", tokenLabel, 0);
+                    }
 
                     key = new RSAOpenSsl(SafeEvpPKeyHandle.OpenPrivateKeyFromEngine("pkcs11", keyName));
 
