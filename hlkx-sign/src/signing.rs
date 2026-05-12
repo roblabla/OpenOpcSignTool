@@ -296,7 +296,7 @@ fn cert_der_filename(cert_der: &[u8]) -> Result<String> {
         .context("Failed to parse certificate DER")?;
     // serial_number().as_bytes() returns the big-endian integer content bytes.
     let bytes = cert.tbs_certificate.serial_number.as_bytes();
-    let reversed: Vec<u8> = bytes.iter().rev().cloned().collect();
+    let reversed: Vec<u8> = bytes.iter().rev().copied().collect();
     let hex_str = hex::encode_upper(&reversed);
     Ok(format!("{}.cer", hex_str))
 }

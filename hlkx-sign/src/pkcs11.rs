@@ -34,7 +34,35 @@ fn extract_label(id: &str) -> &str {
     id
 }
 
-/// Map a `DigestAlgorithm` to the combined RSA PKCS#1 v1.5 + hash PKCS#11 mechanism.
+/// Initialize a PKCS#11 context from the shared library at `module`.
+fn init_pkcs11(module: &str) -> Result<(Pkcs11, Vec<cryptoki::slot::Slot>)> {
+    let pkcs11 = Pkcs11::new(module).context("Failed to load PKCS#11 module")?;
+    pkcs11
+        .initialize(CInitializeArgs::new(CInitializeFlags::OS_LOCKING_OK))
+        .context("Failed to initialize PKCS#11")?;
+    let slots = pkcs11
+        .get_slots_with_initialized_token()
+        .context("Failed to get PKCS#11 slots")?;
+    if slots.is_empty() {
+        bail!("No initialized PKCS#11 token found");
+    }
+    Ok((pkcs11, slots))
+}
+
+/// Optionally log in to a session with the given PIN.
+fn maybe_login(
+    session: &cryptoki::session::Session,
+    pin: Option<&str>,
+) -> Result<()> {
+    if let Some(p) = pin {
+        session
+            .login(UserType::User, Some(&AuthPin::new(Box::from(p))))
+            .context("PKCS#11 login failed")?;
+    }
+    Ok(())
+}
+
+
 fn rsa_pkcs1_mechanism(digest_alg: DigestAlgorithm) -> Mechanism<'static> {
     match digest_alg {
         DigestAlgorithm::Sha1 => Mechanism::Sha1RsaPkcs,
@@ -56,30 +84,13 @@ fn rsa_pkcs1_mechanism(digest_alg: DigestAlgorithm) -> Mechanism<'static> {
 ///               does not require authentication.
 pub fn load_certificate_der(module: &str, cert_id: &str, pin: Option<&str>) -> Result<Vec<u8>> {
     let label = extract_label(cert_id);
-
-    let pkcs11 = Pkcs11::new(module).context("Failed to load PKCS#11 module")?;
-    pkcs11
-        .initialize(CInitializeArgs::new(CInitializeFlags::OS_LOCKING_OK))
-        .context("Failed to initialize PKCS#11")?;
-
-    let slots = pkcs11
-        .get_slots_with_initialized_token()
-        .context("Failed to get PKCS#11 slots")?;
-
-    if slots.is_empty() {
-        bail!("No initialized PKCS#11 token found");
-    }
+    let (pkcs11, slots) = init_pkcs11(module)?;
 
     for slot in slots {
         let session = pkcs11
             .open_ro_session(slot)
             .context("Failed to open PKCS#11 session")?;
-
-        if let Some(p) = pin {
-            session
-                .login(UserType::User, Some(&AuthPin::new(Box::from(p))))
-                .context("PKCS#11 login failed")?;
-        }
+        maybe_login(&session, pin)?;
 
         let search = vec![
             Attribute::Class(ObjectClass::CERTIFICATE),
@@ -125,31 +136,14 @@ pub fn pkcs11_sign(
 ) -> Result<Vec<u8>> {
     let label = extract_label(key_id);
     let mechanism = rsa_pkcs1_mechanism(digest_alg);
-
-    let pkcs11 = Pkcs11::new(module).context("Failed to load PKCS#11 module")?;
-    pkcs11
-        .initialize(CInitializeArgs::new(CInitializeFlags::OS_LOCKING_OK))
-        .context("Failed to initialize PKCS#11")?;
-
-    let slots = pkcs11
-        .get_slots_with_initialized_token()
-        .context("Failed to get PKCS#11 slots")?;
-
-    if slots.is_empty() {
-        bail!("No initialized PKCS#11 token found");
-    }
+    let (pkcs11, slots) = init_pkcs11(module)?;
 
     for slot in slots {
         // Signing may require a read-write session on some tokens.
         let session = pkcs11
             .open_rw_session(slot)
             .context("Failed to open PKCS#11 session")?;
-
-        if let Some(p) = pin {
-            session
-                .login(UserType::User, Some(&AuthPin::new(Box::from(p))))
-                .context("PKCS#11 login failed")?;
-        }
+        maybe_login(&session, pin)?;
 
         let search = vec![
             Attribute::Class(ObjectClass::PRIVATE_KEY),
