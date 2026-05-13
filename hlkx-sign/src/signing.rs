@@ -11,9 +11,9 @@
 
 use crate::c14n::c14n;
 use crate::opc::{
-    entry_to_uri, rels_path_for_part, serialize_rels, OpcPackage, OpcRelationship,
-    MIME_DS_CERTIFICATE, MIME_DS_ORIGIN, MIME_DS_SIGNATURE, MIME_RELS, REL_DS_CERTIFICATE,
-    REL_DS_ORIGIN, REL_DS_SIGNATURE,
+    entry_to_uri, extension_for_opc_content_type, rels_path_for_part, serialize_rels, OpcPackage,
+    OpcRelationship, MIME_DS_CERTIFICATE, MIME_DS_ORIGIN, MIME_DS_SIGNATURE, MIME_RELS,
+    REL_DS_CERTIFICATE, REL_DS_ORIGIN, REL_DS_SIGNATURE,
 };
 use crate::timestamp;
 use crate::xml_sig::{build_signature_xml, DigestAlgorithm, PartDigest, TransformInfo};
@@ -152,12 +152,8 @@ pub fn sign(
 
     for part_path in &parts_to_sign {
         let data = pkg.entries.get(part_path.as_str()).cloned().unwrap_or_default();
-        let mime = pkg.content_type_for_extension(
-            std::path::Path::new(part_path)
-                .extension()
-                .and_then(|e| e.to_str())
-                .unwrap_or(""),
-        ).to_string();
+        let ext_token = extension_for_opc_content_type(part_path);
+        let mime = pkg.content_type_for_extension(ext_token).to_string();
 
         if part_path == crate::opc::GLOBAL_RELS {
             // Two digest entries for _rels/.rels (mirrors OpcSignatureManifest.Build).
@@ -277,13 +273,9 @@ fn digest_rels_part(
     let c14n_filtered = c14n(filtered_xml.as_bytes())?;
     let hash2 = digest_alg.hash(&c14n_filtered);
 
-    // Collect the relationship types for the RelationshipsGroupReference elements.
-    let source_types: Vec<String> = {
-        let mut types: Vec<String> =
-            filtered.iter().map(|r| r.rel_type.clone()).collect();
-        types.dedup();
-        types
-    };
+    // One RelationshipsGroupReference per filtered relationship (same order as C#
+    // `XmlSignatureBuilder` iterating `nodes` from the filtered relationships doc).
+    let source_types: Vec<String> = filtered.iter().map(|r| r.rel_type.clone()).collect();
 
     Ok(vec![
         // Entry 1 – C14N transform only.
@@ -324,15 +316,14 @@ fn build_filtered_rels_xml(rels: &[&OpcRelationship]) -> String {
     s
 }
 
-/// Compute the certificate file name: serial number bytes reversed, hex-encoded.
-/// Matches the C# `ByteArrayToReverseString(certificate.GetSerialNumber())`.
+/// Compute the certificate file name: serial number bytes, hex-encoded.
 fn cert_der_filename(cert_der: &[u8]) -> Result<String> {
     // Parse the DER certificate to extract the serial number.
     let cert = Certificate::from_der(cert_der)
         .context("Failed to parse certificate DER")?;
-    // serial_number().as_bytes() returns the big-endian integer content bytes.
     let bytes = cert.tbs_certificate.serial_number.as_bytes();
-    let reversed: Vec<u8> = bytes.iter().rev().copied().collect();
-    let hex_str = hex::encode_upper(&reversed);
+    // Don't reverse the hex. C# had some broken code that appeared to reverse
+    // it, but actually doesn't.
+    let hex_str = hex::encode_upper(bytes);
     Ok(format!("{}.cer", hex_str))
 }

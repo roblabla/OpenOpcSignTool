@@ -200,27 +200,16 @@ pub fn build_signature_xml(
     // canonicalised – it just embeds the same content).
     doc.extend_from_slice(&object_xml);
 
-    // Optional timestamp <Object>, matching the C# OpcPackageTimestampBuilder output:
-    //
-    //   <Object xmlns="http://www.w3.org/2000/09/xmldsig#">
-    //     <mdssi:TimeStamp Id="idSignatureTimestamp"
-    //         xmlns:mdssi="http://schemas.openxmlformats.org/package/2006/digital-signature">
-    //       <mdssi:Comment>Timestamp got from the time stamp server</mdssi:Comment>
-    //       <mdssi:EncodedTime>BASE64</mdssi:EncodedTime>
-    //     </mdssi:TimeStamp>
-    //   </Object>
+    // Optional timestamp <Object>, matching `OpcPackageTimestampBuilder.ApplyTimestamp`.
     if let Some(token) = timestamp_token {
         let token_b64 = B64.encode(token);
-        doc.extend_from_slice(b"<Object>");
-        doc.extend_from_slice(b"<mdssi:TimeStamp Id=\"idSignatureTimestamp\" xmlns:mdssi=\"");
+        // Match `OpcPackageTimestampBuilder.ApplyTimestamp` (default namespace on
+        // `TimeStamp`, unprefixed children — not `mdssi:` prefixes).
+        doc.extend_from_slice(b"<Object><TimeStamp Id=\"idSignatureTimestamp\" xmlns=\"");
         doc.extend_from_slice(NS_OPC_DSIG.as_bytes());
-        doc.extend_from_slice(b"\">");
-        doc.extend_from_slice(b"<mdssi:Comment>Timestamp got from the time stamp server</mdssi:Comment>");
-        doc.extend_from_slice(b"<mdssi:EncodedTime>");
+        doc.extend_from_slice(b"\"><Comment>Timestamp got from the time stamp server</Comment><EncodedTime>");
         doc.extend_from_slice(token_b64.as_bytes());
-        doc.extend_from_slice(b"</mdssi:EncodedTime>");
-        doc.extend_from_slice(b"</mdssi:TimeStamp>");
-        doc.extend_from_slice(b"</Object>");
+        doc.extend_from_slice(b"</EncodedTime></TimeStamp></Object>");
     }
 
     doc.extend_from_slice(b"</Signature>");

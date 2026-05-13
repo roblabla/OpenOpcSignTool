@@ -44,6 +44,17 @@ pub const MIME_RELS: &str =
     "application/vnd.openxmlformats-package.relationships+xml";
 pub const MIME_OCTET: &str = "application/octet-stream";
 
+/// Extension token used with `[Content_Types].xml` lookup, mirroring .NET
+/// `Path.GetExtension(partPath)?.TrimStart('.')` on `OpcPart` paths.
+///
+/// Rust's [`std::path::Path::extension`] returns `None` for file names like
+/// `.rels` (a leading dot before the extension), which would incorrectly fall
+/// back to `application/octet-stream` for `/_rels/.rels`.
+pub fn extension_for_opc_content_type(part_path: &str) -> &str {
+    let file = part_path.rsplit('/').next().unwrap_or(part_path);
+    file.rfind('.').map(|i| &file[i + 1..]).unwrap_or("")
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // OpcRelationship
 // ─────────────────────────────────────────────────────────────────────────────
@@ -98,7 +109,7 @@ pub fn parse_rels(xml: &[u8]) -> Result<Vec<OpcRelationship>> {
 /// The output is NOT a C14N document; it is the normal on-disk form used by
 /// OPC packages (UTF-8 with XML declaration).
 pub fn serialize_rels(rels: &[OpcRelationship]) -> Vec<u8> {
-    let mut out = b"<?xml version=\"1.0\" encoding=\"utf-8\"?>\n".to_vec();
+    let mut out = b"<?xml version=\"1.0\" encoding=\"utf-8\"?>".to_vec();
     out.extend_from_slice(
         b"<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">",
     );
@@ -176,7 +187,7 @@ pub fn parse_content_types(xml: &[u8]) -> Result<Vec<OpcContentTypeEntry>> {
 }
 
 pub fn serialize_content_types(entries: &[OpcContentTypeEntry]) -> Vec<u8> {
-    let mut out = b"<?xml version=\"1.0\" encoding=\"utf-8\"?>\n".to_vec();
+    let mut out = b"<?xml version=\"1.0\" encoding=\"utf-8\"?>".to_vec();
     out.extend_from_slice(b"<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">");
     for entry in entries {
         match entry {
