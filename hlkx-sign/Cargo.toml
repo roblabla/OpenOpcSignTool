@@ -1,0 +1,24 @@
+[package]
+name = "hlkx-sign"
+version = "0.1.0"
+edition = "2021"
+description = "Tool to sign HLKX/VSIX packages using a PKCS#11 module"
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+chrono = "0.4"
+clap = { version = "4", features = ["derive"] }
+cryptoki = "0.12"
+der = "0.7"
+hex = "0.4"
+quick-xml = "0.37"
+rsa = { version = "0.9", features = ["sha1", "sha2"] }
+sha1 = "0.10"
+sha2 = "0.10"
+signature = "2"
+tempfile = "3"
+ureq = "3"
+uuid = { version = "1", features = ["v4"] }
+x509-cert = "0.2"
+zip = "2.3"

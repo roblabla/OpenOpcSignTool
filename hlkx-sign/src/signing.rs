@@ -1,0 +1,416 @@
+//! Top-level signing orchestration.
+//!
+//! Implements the same logic as the C# `OpcPackageSignatureBuilder.Sign` and
+//! `OpcSignatureManifest.Build` methods:
+//!
+//!  1. Collect all parts that need to be signed.
+//!  2. Compute digests (two for `_rels/.rels`, one for everything else).
+//!  3. Build the XML digital signature.
+//!  4. Write the signature, certificate, and updated relationship/content-type
+//!     files back into the package.
+
+use crate::c14n::c14n;
+use crate::opc::{
+    entry_to_uri, is_digital_signature_origin_target,
+    rels_path_for_part, serialize_rels, OpcPackage, OpcRelationship, MIME_DS_CERTIFICATE,
+    MIME_DS_ORIGIN, MIME_DS_SIGNATURE, MIME_RELS, REL_DS_CERTIFICATE, REL_DS_ORIGIN,
+    REL_DS_SIGNATURE,
+};
+use std::collections::{BTreeMap, HashSet};
+use crate::timestamp;
+use crate::xml_sig::{
+    append_timestamp_object, build_signature_xml, DigestAlgorithm, PartDigest, TransformInfo,
+};
+use anyhow::{bail, Context, Result};
+use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+use chrono::Local;
+use der::Decode;
+use uuid::Uuid;
+use x509_cert::Certificate;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Timestamp configuration
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Optional RFC 3161 timestamp configuration.
+pub struct TimestampConfig<'a> {
+    /// URL of the Time Stamping Authority.
+    pub url: &'a str,
+    /// Hash algorithm to use in the timestamp request (defaults to SHA-256 if
+    /// no explicit selection is made by the caller).
+    pub digest_alg: DigestAlgorithm,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Public entry-point
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Sign the OPC package at `pkg`.
+///
+/// * `certificate_der` – DER-encoded signing certificate (embedded in the package).
+/// * `signer`          – closure that signs the canonical `<SignedInfo>` bytes with
+///                       RSA PKCS#1 v1.5 and returns the raw signature bytes.
+/// * `digest_alg`      – hash algorithm for file digests and the signature.
+/// * `timestamp`       – optional RFC 3161 timestamp configuration; when present,
+///                       the signature value is timestamped and the token embedded.
+/// * `force`           – overwrite an existing signature if one is present.
+pub fn sign(
+    pkg: &mut OpcPackage,
+    certificate_der: &[u8],
+    signer: &dyn Fn(&[u8]) -> Result<Vec<u8>>,
+    digest_alg: DigestAlgorithm,
+    timestamp: Option<&TimestampConfig<'_>>,
+    force: bool,
+) -> Result<()> {
+    if pkg.has_signatures() && !force {
+        bail!("The package is already signed. Use --force to overwrite.");
+    }
+
+    // ── Step 1: Choose file names for the new signature artefacts ─────────
+    let sig_filename = format!("{}.psdsxs", Uuid::new_v4().as_simple());
+    let cert_filename = cert_der_filename(certificate_der)?;
+
+    let origin_part_path = "package/services/digital-signature/origin.psdsor";
+    let sig_part_path = format!(
+        "package/services/digital-signature/xml-signature/{}",
+        sig_filename
+    );
+    let cert_part_path = format!(
+        "package/services/digital-signature/certificate/{}",
+        cert_filename
+    );
+
+    // ── Step 2: Create origin, signature-placeholder, and certificate parts ─
+    // Origin part (empty content).
+    pkg.set_part(origin_part_path, vec![]);
+
+    // Package-level relationship → origin.
+    let origin_target = format!("/{}", origin_part_path);
+    let rel_id = OpcPackage::new_rel_id(&pkg.pkg_rels);
+    pkg.pkg_rels.push(OpcRelationship::new(
+        rel_id,
+        REL_DS_ORIGIN,
+        &origin_target,
+    ));
+
+    // Flush `_rels/.rels` to the entries map now so the digest is computed on
+    // the updated version (same order as the C# code: flush before digests).
+    let rels_bytes = serialize_rels(&pkg.pkg_rels);
+    pkg.entries.insert(crate::opc::GLOBAL_RELS.to_string(), rels_bytes);
+
+    // Signature part (placeholder – written later).
+    pkg.set_part(&sig_part_path, vec![]);
+
+    // Origin → signature relationship.
+    let origin_rels_path = rels_path_for_part(origin_part_path);
+    let origin_rels = pkg
+        .entries
+        .get(origin_rels_path.as_str())
+        .cloned()
+        .unwrap_or_default();
+    let mut origin_rel_list = if origin_rels.is_empty() {
+        vec![]
+    } else {
+        crate::opc::parse_rels(&origin_rels)?
+    };
+    let sig_rel_id = OpcPackage::new_rel_id(&origin_rel_list);
+    origin_rel_list.push(OpcRelationship::new(
+        sig_rel_id,
+        REL_DS_SIGNATURE,
+        &format!("/{}", sig_part_path),
+    ));
+    pkg.entries.insert(origin_rels_path, serialize_rels(&origin_rel_list));
+
+    // Certificate part (DER bytes).
+    pkg.set_part(&cert_part_path, certificate_der.to_vec());
+
+    // Signature → certificate relationship.
+    let sig_rels_path = rels_path_for_part(&sig_part_path);
+    let cert_rel_id = OpcPackage::new_rel_id(&[]);
+    let cert_rels = vec![OpcRelationship::new(
+        cert_rel_id,
+        REL_DS_CERTIFICATE,
+        &format!("/{}", cert_part_path),
+    )];
+    pkg.entries.insert(sig_rels_path, serialize_rels(&cert_rels));
+
+    // ── Step 3: Ensure required content types exist ───────────────────────
+    pkg.ensure_content_type("rels", MIME_RELS);
+    pkg.ensure_content_type("psdsor", MIME_DS_ORIGIN);
+    pkg.ensure_content_type("psdsxs", MIME_DS_SIGNATURE);
+    pkg.ensure_content_type("cer", MIME_DS_CERTIFICATE);
+
+    // ── Step 4: Collect the parts to sign ────────────────────────────────
+    // Same logic as VSIXSignatureBuilderPreset: all parts that are not
+    // themselves digital-signature XML files.
+    let mut parts_to_sign: Vec<String> = pkg
+        .entries
+        .keys()
+        .filter(|p| should_sign_part(p))
+        .cloned()
+        .collect();
+    parts_to_sign.sort();
+
+    // ── Step 5: Compute digests ────────────────────────────────────────────
+    let mut all_digests: Vec<PartDigest> = Vec::new();
+
+    for part_path in &parts_to_sign {
+        let data = pkg.entries.get(part_path.as_str()).cloned().unwrap_or_default();
+        let mime = pkg.content_type_for_part(part_path).to_string();
+
+        if part_path == crate::opc::GLOBAL_RELS {
+            // Two digest entries for _rels/.rels (mirrors OpcSignatureManifest.Build).
+            let digests = digest_rels_part(part_path, &data, &mime, digest_alg, pkg)?;
+            all_digests.extend(digests);
+        } else {
+            // Regular part: simple hash of raw bytes.
+            let hash = digest_alg.hash(&data);
+            let uri = format!("{}?ContentType={}", entry_to_uri(part_path), mime);
+            all_digests.push(PartDigest {
+                uri,
+                digest_b64: B64.encode(&hash),
+                hash_uri: digest_alg.xml_uri().to_string(),
+                transforms: vec![],
+            });
+        }
+    }
+
+    // Sort by URI (case-insensitive, matching the C# sort).
+    all_digests.sort_by(|a, b| a.uri.to_lowercase().cmp(&b.uri.to_lowercase()));
+
+    // ── Step 6: Build the XML signature ───────────────────────────────────
+    let signing_time = Local::now().fixed_offset();
+
+    let (mut sig_xml, sig_bytes) = build_signature_xml(
+        &all_digests,
+        digest_alg,
+        signing_time,
+        signer,
+    )?;
+
+    // ── Optional Step 6b: RFC 3161 timestamp (C# timestamps the existing
+    //     SignatureValue; it does NOT re-sign the package).
+    if let Some(ts) = timestamp {
+        eprintln!("Requesting RFC 3161 timestamp...");
+        let token = timestamp::request_timestamp(ts.url, &sig_bytes, ts.digest_alg)
+            .context("Timestamp request failed")?;
+        sig_xml = append_timestamp_object(sig_xml, &token)?;
+    }
+
+    // ── Step 7: Write the signature into the package ──────────────────────
+    pkg.set_part(&sig_part_path, sig_xml);
+
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Determine whether a ZIP entry path should be included in the signature.
+/// Excludes:
+///   - `[Content_Types].xml`
+///   - existing digital-signature parts (origin, signatures, certificates)
+///   - relationship files that belong to signature parts
+pub(crate) fn should_sign_part(path: &str) -> bool {
+    if path.eq_ignore_ascii_case(crate::opc::CONTENT_TYPES_XML) {
+        return false;
+    }
+    // Exclude the digital-signature infrastructure itself.
+    let ds_prefix = "package/services/digital-signature/";
+    if path.starts_with(ds_prefix) {
+        return false;
+    }
+    // Exclude relationship files that live inside the ds hierarchy.
+    // (e.g. "package/services/digital-signature/_rels/origin.psdsor.rels")
+    if path.contains("/digital-signature/") {
+        return false;
+    }
+    true
+}
+
+/// Compute the two digest entries required for a `_rels/*.rels` part.
+///
+/// Entry 1: C14N of the raw XML bytes.
+/// Entry 2: C14N of a filtered relationships document (the OPC
+///          RelationshipTransform), excluding the origin relationship.
+pub(crate) fn digest_rels_part(
+    part_path: &str,
+    raw_xml: &[u8],
+    mime: &str,
+    digest_alg: DigestAlgorithm,
+    pkg: &OpcPackage,
+) -> Result<Vec<PartDigest>> {
+    let uri = format!("{}?ContentType={}", entry_to_uri(part_path), mime);
+
+    // ── Entry 1: C14N of the raw XML ──────────────────────────────────────
+    let c14n_raw = c14n(raw_xml)?;
+    let hash1 = digest_alg.hash(&c14n_raw);
+
+    // ── Entry 2: RelationshipTransform + C14N ─────────────────────────────
+    // Build a sorted filtered relationships document (mirrors
+    // `OpcSignatureManifest.GetRelationships`: exclude origin by Target URI,
+    // dedupe by Id, sort by Id).
+    let filtered = filtered_package_relationships(pkg);
+    let filtered_refs: Vec<&OpcRelationship> = filtered.iter().collect();
+
+    // Serialize in the form used by InternalRelationshipCollection:
+    // each Relationship has TargetMode="Internal".
+    let filtered_xml = build_filtered_rels_xml(&filtered_refs);
+    let c14n_filtered = c14n(filtered_xml.as_bytes())?;
+    let hash2 = digest_alg.hash(&c14n_filtered);
+
+    // One RelationshipsGroupReference per distinct SourceType (first-seen order when
+    // relationships are sorted by Id). Duplicate selectors are redundant for the
+    // RelationshipTransform and are omitted in Microsoft-accepted HLKX signatures.
+    let source_types = unique_relationship_source_types(&filtered_refs);
+
+    Ok(vec![
+        // Entry 1 – C14N transform only.
+        PartDigest {
+            uri: uri.clone(),
+            digest_b64: B64.encode(&hash1),
+            hash_uri: digest_alg.xml_uri().to_string(),
+            transforms: vec![TransformInfo::C14n],
+        },
+        // Entry 2 – RelationshipTransform + C14N.
+        PartDigest {
+            uri,
+            digest_b64: B64.encode(&hash2),
+            hash_uri: digest_alg.xml_uri().to_string(),
+            transforms: vec![
+                TransformInfo::RelationshipTransform { source_types },
+                TransformInfo::C14n,
+            ],
+        },
+    ])
+}
+
+/// Distinct relationship `Type` values in first-seen order (relationships sorted by Id).
+pub(crate) fn unique_relationship_source_types(rels: &[&OpcRelationship]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for r in rels {
+        if seen.insert(r.rel_type.as_str()) {
+            out.push(r.rel_type.clone());
+        }
+    }
+    out
+}
+
+/// Relationships to include in the RelationshipTransform digest, matching
+/// `OpcSignatureManifest.GetRelationships`.
+pub(crate) fn filtered_package_relationships(pkg: &OpcPackage) -> Vec<OpcRelationship> {
+    let mut by_id: BTreeMap<String, OpcRelationship> = BTreeMap::new();
+    for rel in &pkg.pkg_rels {
+        if is_digital_signature_origin_target(&rel.target) {
+            continue;
+        }
+        by_id.entry(rel.id.clone()).or_insert_with(|| rel.clone());
+    }
+    by_id.into_values().collect()
+}
+
+/// Build the XML document used as input to the RelationshipTransform.
+/// Matches the output of `InternalRelationshipCollection.WriteRelationshipsAsXml`
+/// with `alwaysWriteTargetModeAttribute = true` (attribute order: Type, Target,
+/// TargetMode, Id).
+pub(crate) fn build_filtered_rels_xml(rels: &[&OpcRelationship]) -> String {
+    use crate::opc::xml_escape_attr;
+    let mut s = String::new();
+    s.push_str("<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">");
+    for r in rels {
+        s.push_str("<Relationship");
+        s.push_str(" Type=\"");
+        s.push_str(&xml_escape_attr(&r.rel_type));
+        s.push_str("\" Target=\"");
+        s.push_str(&xml_escape_attr(&r.target));
+        s.push_str("\" TargetMode=\"Internal\" Id=\"");
+        s.push_str(&xml_escape_attr(&r.id));
+        s.push_str("\" />");
+    }
+    s.push_str("</Relationships>");
+    s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::opc::{
+        is_digital_signature_origin_target, normalize_relationship_target, DS_ORIGIN_PART_PATH,
+        DS_ORIGIN_PART_URI, MIME_OCTET,
+    };
+    use std::collections::HashMap;
+
+    #[test]
+    fn default_mime_matches_csharp() {
+        assert_eq!(MIME_OCTET, "application/octet");
+    }
+
+    #[test]
+    fn origin_target_normalization() {
+        assert_eq!(
+            normalize_relationship_target(DS_ORIGIN_PART_URI),
+            DS_ORIGIN_PART_PATH
+        );
+        assert_eq!(
+            normalize_relationship_target(DS_ORIGIN_PART_PATH),
+            DS_ORIGIN_PART_PATH
+        );
+        assert!(is_digital_signature_origin_target(DS_ORIGIN_PART_URI));
+        assert!(is_digital_signature_origin_target(DS_ORIGIN_PART_PATH));
+        assert!(!is_digital_signature_origin_target("/hck/data/foo"));
+    }
+
+    #[test]
+    fn append_timestamp_preserves_signature_value() {
+        use crate::xml_sig::append_timestamp_object;
+        let sig_xml = b"<?xml version=\"1.0\"?><Signature xmlns=\"http://www.w3.org/2000/09/xmldsig#\"><SignatureValue>QUJD</SignatureValue></Signature>".to_vec();
+        let out = append_timestamp_object(sig_xml, b"fake-token").unwrap();
+        let s = std::str::from_utf8(&out).unwrap();
+        assert!(s.contains("<TimeStamp"));
+        assert_eq!(s.matches("<SignatureValue>QUJD</SignatureValue>").count(), 1);
+    }
+
+    #[test]
+    fn unique_source_types_dedupes_telemetry() {
+        let rels = vec![
+            OpcRelationship::new("r1", "http://example.com/telemetry", "/a"),
+            OpcRelationship::new("r2", "http://example.com/coredata", "/b"),
+            OpcRelationship::new("r3", "http://example.com/telemetry", "/c"),
+        ];
+        let refs: Vec<&OpcRelationship> = rels.iter().collect();
+        let types = unique_relationship_source_types(&refs);
+        assert_eq!(types.len(), 2);
+        assert_eq!(types[0], "http://example.com/telemetry");
+        assert_eq!(types[1], "http://example.com/coredata");
+    }
+
+    #[test]
+    fn filtered_rels_exclude_origin_by_target() {
+        let pkg = OpcPackage {
+            path: std::path::PathBuf::from("test.hlkx"),
+            entries: HashMap::new(),
+            content_types: vec![],
+            pkg_rels: vec![
+                OpcRelationship::new("r1", REL_DS_ORIGIN, DS_ORIGIN_PART_PATH),
+                OpcRelationship::new("r2", "http://example.com/other", "/part.bin"),
+            ],
+        };
+        let filtered = filtered_package_relationships(&pkg);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].id, "r2");
+    }
+}
+
+/// Compute the certificate file name: serial number bytes, hex-encoded.
+fn cert_der_filename(cert_der: &[u8]) -> Result<String> {
+    // Parse the DER certificate to extract the serial number.
+    let cert = Certificate::from_der(cert_der)
+        .context("Failed to parse certificate DER")?;
+    let bytes = cert.tbs_certificate.serial_number.as_bytes();
+    // Don't reverse the hex. C# had some broken code that appeared to reverse
+    // it, but actually doesn't.
+    let hex_str = hex::encode_upper(bytes);
+    Ok(format!("{}.cer", hex_str))
+}
