@@ -12,12 +12,12 @@
 use crate::c14n::c14n;
 use crate::debug_log;
 use crate::opc::{
-    entry_to_uri, extension_for_opc_content_type, is_digital_signature_origin_target,
+    entry_to_uri, is_digital_signature_origin_target,
     rels_path_for_part, serialize_rels, OpcPackage, OpcRelationship, MIME_DS_CERTIFICATE,
     MIME_DS_ORIGIN, MIME_DS_SIGNATURE, MIME_RELS, REL_DS_CERTIFICATE, REL_DS_ORIGIN,
     REL_DS_SIGNATURE,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use crate::timestamp;
 use crate::xml_sig::{
     append_timestamp_object, build_signature_xml, DigestAlgorithm, PartDigest, TransformInfo,
@@ -157,8 +157,7 @@ pub fn sign(
 
     for part_path in &parts_to_sign {
         let data = pkg.entries.get(part_path.as_str()).cloned().unwrap_or_default();
-        let ext_token = extension_for_opc_content_type(part_path);
-        let mime = pkg.content_type_for_extension(ext_token).to_string();
+        let mime = pkg.content_type_for_part(part_path).to_string();
 
         if part_path == crate::opc::GLOBAL_RELS {
             // Two digest entries for _rels/.rels (mirrors OpcSignatureManifest.Build).
@@ -180,6 +179,25 @@ pub fn sign(
     // Sort by URI (case-insensitive, matching the C# sort).
     all_digests.sort_by(|a, b| a.uri.to_lowercase().cmp(&b.uri.to_lowercase()));
     // #region agent log
+    {
+        let sample: Vec<_> = parts_to_sign
+            .iter()
+            .take(3)
+            .map(|p| {
+                format!(
+                    "{{\"part\":\"{}\",\"content_type\":\"{}\"}}",
+                    p,
+                    pkg.content_type_for_part(p)
+                )
+            })
+            .collect();
+        debug_log::log(
+            "I",
+            "signing.rs:sign",
+            "resolved part content types",
+            &format!(r#"{{"sample":{sample:?}}}"#),
+        );
+    }
     debug_log::log(
         "A",
         "signing.rs:sign",
@@ -306,24 +324,26 @@ fn digest_rels_part(
     let filtered_xml = build_filtered_rels_xml(&filtered_refs);
     let c14n_filtered = c14n(filtered_xml.as_bytes())?;
     let hash2 = digest_alg.hash(&c14n_filtered);
+
+    // One RelationshipsGroupReference per distinct SourceType (first-seen order when
+    // relationships are sorted by Id). Duplicate selectors are redundant for the
+    // RelationshipTransform and are omitted in Microsoft-accepted HLKX signatures.
+    let source_types = unique_relationship_source_types(&filtered_refs);
     // #region agent log
     debug_log::log(
         "C",
         "signing.rs:digest_rels_part",
         "filtered rels digest",
         &format!(
-            r#"{{"hash2_b64":"{}","filtered_count":{},"source_type_count":{},"filtered_xml_len":{}}}"#,
+            r#"{{"hash2_b64":"{}","filtered_count":{},"source_type_count":{},"unique_source_types":{},"filtered_xml_len":{}}}"#,
             B64.encode(&hash2),
             filtered.len(),
             filtered_refs.len(),
+            source_types.len(),
             filtered_xml.len()
         ),
     );
     // #endregion
-
-    // One RelationshipsGroupReference per filtered relationship (same order as C#
-    // `XmlSignatureBuilder` iterating `nodes` from the filtered relationships doc).
-    let source_types: Vec<String> = filtered_refs.iter().map(|r| r.rel_type.clone()).collect();
 
     Ok(vec![
         // Entry 1 – C14N transform only.
@@ -341,6 +361,18 @@ fn digest_rels_part(
             transforms: vec![TransformInfo::RelationshipTransform { source_types }],
         },
     ])
+}
+
+/// Distinct relationship `Type` values in first-seen order (relationships sorted by Id).
+fn unique_relationship_source_types(rels: &[&OpcRelationship]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for r in rels {
+        if seen.insert(r.rel_type.as_str()) {
+            out.push(r.rel_type.clone());
+        }
+    }
+    out
 }
 
 /// Relationships to include in the RelationshipTransform digest, matching
@@ -599,6 +631,20 @@ mod tests {
         );
         assert_eq!(rels_digests.first(), Some(&hash_rels.as_str()));
         assert_eq!(rels_digests.get(1), Some(&hash_filt.as_str()));
+    }
+
+    #[test]
+    fn unique_source_types_dedupes_telemetry() {
+        let rels = vec![
+            OpcRelationship::new("r1", "http://example.com/telemetry", "/a"),
+            OpcRelationship::new("r2", "http://example.com/coredata", "/b"),
+            OpcRelationship::new("r3", "http://example.com/telemetry", "/c"),
+        ];
+        let refs: Vec<&OpcRelationship> = rels.iter().collect();
+        let types = unique_relationship_source_types(&refs);
+        assert_eq!(types.len(), 2);
+        assert_eq!(types[0], "http://example.com/telemetry");
+        assert_eq!(types[1], "http://example.com/coredata");
     }
 
     #[test]

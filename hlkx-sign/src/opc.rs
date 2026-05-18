@@ -127,10 +127,11 @@ pub fn serialize_rels(rels: &[OpcRelationship]) -> Vec<u8> {
     let mut sorted: Vec<&OpcRelationship> = rels.iter().collect();
     sorted.sort_by(|a, b| a.id.cmp(&b.id));
     for rel in &sorted {
+        // Attribute order matches `OpcRelationships.ToXml` in the C# tool.
         out.extend_from_slice(b"<Relationship");
-        write!(out, " Id=\"{}\"", xml_escape_attr(&rel.id)).unwrap();
-        write!(out, " Target=\"{}\"", xml_escape_attr(&rel.target)).unwrap();
         write!(out, " Type=\"{}\"", xml_escape_attr(&rel.rel_type)).unwrap();
+        write!(out, " Target=\"{}\"", xml_escape_attr(&rel.target)).unwrap();
+        write!(out, " Id=\"{}\"", xml_escape_attr(&rel.id)).unwrap();
         out.extend_from_slice(b" />");
     }
     out.extend_from_slice(b"</Relationships>");
@@ -299,6 +300,23 @@ impl OpcPackage {
             }
         }
         MIME_OCTET
+    }
+
+    /// Effective content type for a package part path (e.g. `hck/data/foo`).
+    ///
+    /// OPC `[Content_Types].xml` `Override` entries take precedence over
+    /// `Default` extension rules. Microsoft validators resolve the
+    /// `?ContentType=` query on manifest references this way.
+    pub fn content_type_for_part(&self, part_path: &str) -> &str {
+        let part_uri = entry_to_uri(part_path);
+        for entry in &self.content_types {
+            if let OpcContentTypeEntry::Override { part_name, content_type } = entry {
+                if part_name.eq_ignore_ascii_case(&part_uri) {
+                    return content_type.as_str();
+                }
+            }
+        }
+        self.content_type_for_extension(extension_for_opc_content_type(part_path))
     }
 
     /// Ensure that `<Default Extension="…" ContentType="…" />` exists.

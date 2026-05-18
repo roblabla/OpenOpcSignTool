@@ -327,6 +327,21 @@ fn build_object_content(
                         );
                     }
                     TransformInfo::RelationshipTransform { source_types } => {
+                        // #region agent log
+                        debug_log::log(
+                            "G",
+                            "xml_sig.rs:build_object_content",
+                            "relationship transform selectors",
+                            &format!(
+                                r#"{{"selector_count":{},"unique_count":{}}}"#,
+                                source_types.len(),
+                                source_types
+                                    .iter()
+                                    .collect::<std::collections::HashSet<_>>()
+                                    .len()
+                            ),
+                        );
+                        // #endregion
                         xml.push_str("<Transform Algorithm=\"");
                         xml.push_str(REL_TRANSFORM_URL);
                         xml.push_str("\">");
