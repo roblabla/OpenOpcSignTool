@@ -149,15 +149,13 @@ pub enum TransformInfo {
 /// `signer` is a closure that accepts the canonical `<SignedInfo>` bytes and
 /// returns the RSA PKCS#1 v1.5 signature bytes.
 ///
-/// `timestamp_token` is the optional DER-encoded CMS token returned by a TSA.
-/// When present it is base64-encoded and embedded as a second `<Object>` element
-/// matching the format produced by the C# `OpcPackageTimestampBuilder`.
+/// Returns the UTF-8 signature document and the raw `SignatureValue` bytes that
+/// were signed (needed for RFC 3161 timestamping).
 pub fn build_signature_xml(
     digests: &[PartDigest],
     digest_alg: DigestAlgorithm,
     signing_time: DateTime<FixedOffset>,
     signer: &dyn Fn(&[u8]) -> Result<Vec<u8>>,
-    timestamp_token: Option<&[u8]>,
 ) -> Result<(Vec<u8>, Vec<u8>)> {
     // ── 1. Build the <Object> element (canonical bytes for hashing, serialized
     //        bytes for the on-disk .psdsxs matching the C# XmlTextWriter output).
@@ -216,21 +214,31 @@ pub fn build_signature_xml(
     // no redundant xmlns on Object because it inherits from <Signature>).
     doc.extend_from_slice(&object_document);
 
-    // Optional timestamp <Object>, matching `OpcPackageTimestampBuilder.ApplyTimestamp`.
-    if let Some(token) = timestamp_token {
-        let token_b64 = B64.encode(token);
-        // Match `OpcPackageTimestampBuilder.ApplyTimestamp` (default namespace on
-        // `TimeStamp`, unprefixed children — not `mdssi:` prefixes).
-        doc.extend_from_slice(b"<Object><TimeStamp Id=\"idSignatureTimestamp\" xmlns=\"");
-        doc.extend_from_slice(NS_OPC_DSIG.as_bytes());
-        doc.extend_from_slice(b"\"><Comment>Timestamp got from the time stamp server</Comment><EncodedTime>");
-        doc.extend_from_slice(token_b64.as_bytes());
-        doc.extend_from_slice(b"</EncodedTime></TimeStamp></Object>");
-    }
-
     doc.extend_from_slice(b"</Signature>");
 
     Ok((doc, sig_bytes))
+}
+
+/// Append a timestamp `<Object>` to an existing signature document without
+/// re-signing, matching `OpcPackageTimestampBuilder.ApplyTimestamp` in the C#
+/// tool (timestamp the existing `SignatureValue`, then add the token).
+pub fn append_timestamp_object(mut sig_xml: Vec<u8>, token: &[u8]) -> Result<Vec<u8>> {
+    let close = b"</Signature>";
+    let pos = sig_xml
+        .windows(close.len())
+        .rposition(|w| w == close)
+        .context("signature document missing </Signature>")?;
+    let token_b64 = B64.encode(token);
+    let mut insert = Vec::new();
+    insert.extend_from_slice(b"<Object><TimeStamp Id=\"idSignatureTimestamp\" xmlns=\"");
+    insert.extend_from_slice(NS_OPC_DSIG.as_bytes());
+    insert.extend_from_slice(
+        b"\"><Comment>Timestamp got from the time stamp server</Comment><EncodedTime>",
+    );
+    insert.extend_from_slice(token_b64.as_bytes());
+    insert.extend_from_slice(b"</EncodedTime></TimeStamp></Object>");
+    sig_xml.splice(pos..pos, insert.iter().copied());
+    Ok(sig_xml)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

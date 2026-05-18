@@ -19,7 +19,9 @@ use crate::opc::{
 };
 use std::collections::BTreeMap;
 use crate::timestamp;
-use crate::xml_sig::{build_signature_xml, DigestAlgorithm, PartDigest, TransformInfo};
+use crate::xml_sig::{
+    append_timestamp_object, build_signature_xml, DigestAlgorithm, PartDigest, TransformInfo,
+};
 use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use chrono::Local;
@@ -193,29 +195,40 @@ pub fn sign(
     // ── Step 6: Build the XML signature ───────────────────────────────────
     let signing_time = Local::now().fixed_offset();
 
-    // First build without timestamp token so we can get the signature value.
     let (mut sig_xml, sig_bytes) = build_signature_xml(
         &all_digests,
         digest_alg,
         signing_time,
         signer,
-        None, // no timestamp yet – we need sig_bytes first
     )?;
 
-    // ── Optional Step 6b: Request timestamp and re-build with token ────────
+    // ── Optional Step 6b: RFC 3161 timestamp (C# timestamps the existing
+    //     SignatureValue; it does NOT re-sign the package).
     if let Some(ts) = timestamp {
         eprintln!("Requesting RFC 3161 timestamp...");
         let token = timestamp::request_timestamp(ts.url, &sig_bytes, ts.digest_alg)
             .context("Timestamp request failed")?;
 
-        // Re-build the XML signature with the timestamp token embedded.
-        (sig_xml, _) = build_signature_xml(
-            &all_digests,
-            digest_alg,
-            signing_time,
-            signer,
-            Some(&token),
-        )?;
+        let sig_b64_before = B64.encode(&sig_bytes);
+        sig_xml = append_timestamp_object(sig_xml, &token)?;
+        let sig_xml_str = std::str::from_utf8(&sig_xml).unwrap_or("");
+        let sig_b64_after = sig_xml_str
+            .split("<SignatureValue>")
+            .nth(1)
+            .and_then(|s| s.split('<').next())
+            .unwrap_or("");
+        // #region agent log
+        debug_log::log(
+            "F",
+            "signing.rs:sign",
+            "timestamp append preserves signaturevalue",
+            &format!(
+                r#"{{"sig_unchanged":{},"sig_len":{}}}"#,
+                sig_b64_before == sig_b64_after,
+                sig_bytes.len()
+            ),
+        );
+        // #endregion
     }
 
     // ── Step 7: Write the signature into the package ──────────────────────
@@ -396,8 +409,41 @@ mod tests {
 
     /// Verify canonical SignedInfo from on-disk psdsxs matches signing-time c14n.
     #[test]
+    fn append_timestamp_preserves_signature_value() {
+        use crate::xml_sig::append_timestamp_object;
+        let sig_xml = b"<?xml version=\"1.0\"?><Signature xmlns=\"http://www.w3.org/2000/09/xmldsig#\"><SignatureValue>QUJD</SignatureValue></Signature>".to_vec();
+        let out = append_timestamp_object(sig_xml, b"fake-token").unwrap();
+        let s = std::str::from_utf8(&out).unwrap();
+        assert!(s.contains("<TimeStamp"));
+        assert_eq!(s.matches("<SignatureValue>QUJD</SignatureValue>").count(), 1);
+    }
+
+    #[test]
+    fn write_canon_si_for_openssl() {
+        const PSDSXS: &str = "/private/tmp/hlelam/new2/package/services/digital-signature/xml-signature/430b3e8ff3144058ab4245fcf8dae1f9.psdsxs";
+        if !std::path::Path::new(PSDSXS).exists() {
+            return;
+        }
+        let psdsxs = std::fs::read_to_string(PSDSXS).unwrap();
+        let si_start = psdsxs.find("<SignedInfo>").unwrap();
+        let si_end = psdsxs.find("</SignedInfo>").unwrap() + "</SignedInfo>".len();
+        let wrapped = format!(
+            "<Signature xmlns=\"http://www.w3.org/2000/09/xmldsig#\">{}</Signature>",
+            &psdsxs[si_start..si_end]
+        );
+        let canon = c14n(wrapped.as_bytes()).unwrap();
+        let s = std::str::from_utf8(&canon).unwrap();
+        let start = s.find("<SignedInfo").unwrap();
+        let end = s.find("</SignedInfo>").unwrap() + "</SignedInfo>".len();
+        std::fs::write("/tmp/canon_si.bin", &canon[start..end]).unwrap();
+        let sig_b64 = psdsxs.split("<SignatureValue>").nth(1).unwrap().split('<').next().unwrap();
+        std::fs::write("/tmp/sig.bin", base64::engine::general_purpose::STANDARD.decode(sig_b64).unwrap()).unwrap();
+        eprintln!("wrote /tmp/canon_si.bin ({} bytes) and /tmp/sig.bin", end - start);
+    }
+
+    #[test]
     fn verify_new_package_signed_info_canonicalization() {
-        const PSDSXS: &str = "/private/tmp/hlelam/new/package/services/digital-signature/xml-signature/891c120eb4864a56a36f5039be7b3734.psdsxs";
+        const PSDSXS: &str = "/private/tmp/hlelam/new2/package/services/digital-signature/xml-signature/430b3e8ff3144058ab4245fcf8dae1f9.psdsxs";
         if !std::path::Path::new(PSDSXS).exists() {
             return;
         }
@@ -444,7 +490,7 @@ mod tests {
     /// Verify canonical Object digest in SignedInfo matches our c14n.
     #[test]
     fn verify_new_package_object_digest() {
-        const PSDSXS: &str = "/private/tmp/hlelam/new/package/services/digital-signature/xml-signature/891c120eb4864a56a36f5039be7b3734.psdsxs";
+        const PSDSXS: &str = "/private/tmp/hlelam/new2/package/services/digital-signature/xml-signature/430b3e8ff3144058ab4245fcf8dae1f9.psdsxs";
         if !std::path::Path::new(PSDSXS).exists() {
             return;
         }
@@ -475,8 +521,8 @@ mod tests {
     /// Verify manifest digests in `/private/tmp/hlelam/new` match our algorithms.
     #[test]
     fn verify_new_package_manifest_digests() {
-        const PKG: &str = "/private/tmp/hlelam/new";
-        const PSDSXS: &str = "/private/tmp/hlelam/new/package/services/digital-signature/xml-signature/891c120eb4864a56a36f5039be7b3734.psdsxs";
+        const PKG: &str = "/private/tmp/hlelam/new2";
+        const PSDSXS: &str = "/private/tmp/hlelam/new2/package/services/digital-signature/xml-signature/430b3e8ff3144058ab4245fcf8dae1f9.psdsxs";
         if !std::path::Path::new(PSDSXS).exists() {
             eprintln!("skip verify_new_package_manifest_digests: package not present");
             return;
