@@ -42,14 +42,24 @@ pub const MIME_DS_CERTIFICATE: &str =
     "application/vnd.openxmlformats-package.digital-signature-certificate";
 pub const MIME_RELS: &str =
     "application/vnd.openxmlformats-package.relationships+xml";
-pub const MIME_OCTET: &str = "application/octet-stream";
+/// Default part content type when no `[Content_Types].xml` entry matches (matches
+/// `OpcKnownMimeTypes.OctetString` in the C# tool).
+pub const MIME_OCTET: &str = "application/octet";
+
+/// Origin part URI used when filtering package relationships for signing (matches
+/// `XTable.ID.OriginFileUri` / in-memory `OpcRelationship.Target` in the C# tool).
+pub const DS_ORIGIN_PART_URI: &str =
+    "package:///package/services/digital-signature/origin.psdsor";
+
+/// `Target` attribute form written to `_rels/.rels` (matches `Uri.ToQualifiedPath()`).
+pub const DS_ORIGIN_PART_PATH: &str = "/package/services/digital-signature/origin.psdsor";
 
 /// Extension token used with `[Content_Types].xml` lookup, mirroring .NET
 /// `Path.GetExtension(partPath)?.TrimStart('.')` on `OpcPart` paths.
 ///
 /// Rust's [`std::path::Path::extension`] returns `None` for file names like
 /// `.rels` (a leading dot before the extension), which would incorrectly fall
-/// back to `application/octet-stream` for `/_rels/.rels`.
+/// back to [`MIME_OCTET`] (`application/octet`) for `/_rels/.rels`.
 pub fn extension_for_opc_content_type(part_path: &str) -> &str {
     let file = part_path.rsplit('/').next().unwrap_or(part_path);
     file.rfind('.').map(|i| &file[i + 1..]).unwrap_or("")
@@ -279,7 +289,7 @@ impl OpcPackage {
     }
 
     /// Look up the MIME content-type for a given file extension.
-    /// Falls back to `application/octet-stream` if not found.
+    /// Falls back to [`MIME_OCTET`] if not found.
     pub fn content_type_for_extension(&self, ext: &str) -> &str {
         for entry in &self.content_types {
             if let OpcContentTypeEntry::Default { extension, content_type } = entry {
@@ -389,6 +399,31 @@ pub fn rels_path_for_part(part_path: &str) -> String {
         }
         None => format!("_rels/{}.rels", part_path),
     }
+}
+
+/// Normalize a relationship `Target` to a leading-slash package path.
+pub fn normalize_relationship_target(target: &str) -> String {
+    let t = target.trim();
+    if let Some(rest) = t.strip_prefix("package:///") {
+        if rest.starts_with('/') {
+            rest.to_string()
+        } else {
+            format!("/{rest}")
+        }
+    } else if let Some(rest) = t.strip_prefix("package:/") {
+        let rest = rest.trim_start_matches('/');
+        format!("/{rest}")
+    } else if t.starts_with('/') {
+        t.to_string()
+    } else {
+        format!("/{t}")
+    }
+}
+
+/// True when `target` refers to the digital-signature origin part (matches
+/// `OpcSignatureManifest.GetRelationships` in the C# implementation).
+pub fn is_digital_signature_origin_target(target: &str) -> bool {
+    normalize_relationship_target(target) == DS_ORIGIN_PART_PATH
 }
 
 /// Map a ZIP entry path to a URI-style path (e.g. `"/foo/bar.xml"`).

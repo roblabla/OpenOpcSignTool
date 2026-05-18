@@ -5,7 +5,8 @@
 
 use crate::c14n::c14n;
 use crate::opc::xml_escape_attr;
-use anyhow::Result;
+use anyhow::{Context, Result};
+use std::collections::HashSet;
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use chrono::{DateTime, FixedOffset};
 use sha1::Digest as Sha1Digest;
@@ -158,11 +159,13 @@ pub fn build_signature_xml(
     signer: &dyn Fn(&[u8]) -> Result<Vec<u8>>,
     timestamp_token: Option<&[u8]>,
 ) -> Result<(Vec<u8>, Vec<u8>)> {
-    // ── 1. Build the <Object> element in C14N form ───────────────────────
-    let object_xml = build_object_xml(digests, digest_alg, signing_time)?;
+    // ── 1. Build the <Object> element (canonical bytes for hashing, serialized
+    //        bytes for the on-disk .psdsxs matching the C# XmlTextWriter output).
+    let (object_canonical, object_document) =
+        build_object_xml(digests, signing_time)?;
 
     // ── 2. Hash the canonical <Object> ──────────────────────────────────
-    let object_hash = digest_alg.hash(&object_xml);
+    let object_hash = digest_alg.hash(&object_canonical);
     let object_hash_b64 = B64.encode(&object_hash);
 
     // ── 3. Build the canonical <SignedInfo> and sign it ──────────────────
@@ -176,7 +179,7 @@ pub fn build_signature_xml(
     // ── 4. Assemble the full <Signature> document ─────────────────────────
     // The final file has an XML declaration.
     let mut doc = Vec::new();
-    doc.extend_from_slice(b"<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>");
+    doc.extend_from_slice(b"<?xml version=\"1.0\" encoding=\"utf-8\" standalone=\"yes\"?>");
 
     // <Signature> root.
     doc.extend_from_slice(b"<Signature Id=\"SignatureIdValue\" xmlns=\"");
@@ -196,9 +199,9 @@ pub fn build_signature_xml(
     doc.extend_from_slice(sig_b64.as_bytes());
     doc.extend_from_slice(b"</SignatureValue>");
 
-    // <Object> (already built in canonical form but the final document is not
-    // canonicalised – it just embeds the same content).
-    doc.extend_from_slice(&object_xml);
+    // <Object> – serialized like .NET XmlTextWriter (self-closing empty tags,
+    // no redundant xmlns on Object because it inherits from <Signature>).
+    doc.extend_from_slice(&object_document);
 
     // Optional timestamp <Object>, matching `OpcPackageTimestampBuilder.ApplyTimestamp`.
     if let Some(token) = timestamp_token {
@@ -221,19 +224,80 @@ pub fn build_signature_xml(
 // <Object> builder
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Build the `<Object Id="idPackageObject">` XML element in C14N-compatible
-/// form (i.e. what we produce here *is* the canonical form we hash).
+/// Append an empty element using either C14N expanded form or .NET-style ` />`.
+fn push_empty_element(xml: &mut String, name: &str, attrs: &str, self_closing: bool) {
+    if self_closing {
+        xml.push('<');
+        xml.push_str(name);
+        xml.push_str(attrs);
+        xml.push_str(" />");
+    } else {
+        xml.push('<');
+        xml.push_str(name);
+        xml.push_str(attrs);
+        xml.push_str("></");
+        xml.push_str(name);
+        xml.push('>');
+    }
+}
+
+/// One `RelationshipsGroupReference` per distinct `SourceType`, preserving the
+/// first-seen order (matches Microsoft OPC tooling; duplicate selectors are
+/// redundant for the RelationshipTransform).
+fn unique_source_types(source_types: &[String]) -> Vec<&str> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for st in source_types {
+        if seen.insert(st.as_str()) {
+            out.push(st.as_str());
+        }
+    }
+    out
+}
+
+/// Canonicalize a dsig-namespaced fragment that will live under `<Signature>`.
+fn c14n_dsig_fragment(inner: &str) -> Result<Vec<u8>> {
+    let wrapped = format!("<Signature xmlns=\"{NS_DSIG}\">{inner}</Signature>");
+    let canon = c14n(wrapped.as_bytes())?;
+    extract_element(&canon, "Object")
+}
+
+fn extract_element(canon: &[u8], local_name: &str) -> Result<Vec<u8>> {
+    let s = std::str::from_utf8(canon).context("canonical form is not valid UTF-8")?;
+    let open = format!("<{local_name}");
+    let start = s
+        .find(&open)
+        .with_context(|| format!("`<{local_name}` not found in canonical output"))?;
+    let close = format!("</{local_name}>");
+    let end = s
+        .find(&close)
+        .with_context(|| format!("`</{local_name}>` not found in canonical output"))?
+        + close.len();
+    Ok(canon[start..end].to_vec())
+}
+
+/// Build `<Object Id="idPackageObject">` for hashing (C14N) and for the final
+/// `.psdsxs` document (self-closing empty tags, no redundant xmlns on Object).
 fn build_object_xml(
     digests: &[PartDigest],
-    _digest_alg: DigestAlgorithm,
     signing_time: DateTime<FixedOffset>,
-) -> Result<Vec<u8>> {
-    let mut xml = String::new();
-    xml.push_str("<Object Id=\"idPackageObject\" xmlns=\"");
-    xml.push_str(NS_DSIG);
-    xml.push_str("\">");
+) -> Result<(Vec<u8>, Vec<u8>)> {
+    let inner = build_object_content(digests, signing_time, false);
+    let canonical = c14n_dsig_fragment(&inner)?;
+    let document = build_object_content(digests, signing_time, true).into_bytes();
+    Ok((canonical, document))
+}
 
-    // ── <Manifest> ───────────────────────────────────────────────────────
+/// Serialize `<Object Id="idPackageObject">…</Object>` without a redundant
+/// default-namespace declaration (inherits from `<Signature>` in the final file).
+fn build_object_content(
+    digests: &[PartDigest],
+    signing_time: DateTime<FixedOffset>,
+    self_closing: bool,
+) -> String {
+    let mut xml = String::new();
+    xml.push_str("<Object Id=\"idPackageObject\">");
+
     xml.push_str("<Manifest xmlns:opc=\"");
     xml.push_str(NS_OPC_DSIG);
     xml.push_str("\">");
@@ -248,33 +312,44 @@ fn build_object_xml(
             for t in &d.transforms {
                 match t {
                     TransformInfo::C14n => {
-                        xml.push_str("<Transform Algorithm=\"");
-                        xml.push_str(C14N_URL);
-                        xml.push_str("\"></Transform>");
+                        push_empty_element(
+                            &mut xml,
+                            "Transform",
+                            &format!(" Algorithm=\"{C14N_URL}\""),
+                            self_closing,
+                        );
                     }
                     TransformInfo::RelationshipTransform { source_types } => {
                         xml.push_str("<Transform Algorithm=\"");
                         xml.push_str(REL_TRANSFORM_URL);
                         xml.push_str("\">");
-                        for st in source_types {
-                            xml.push_str("<opc:RelationshipsGroupReference SourceType=\"");
-                            xml.push_str(&xml_escape_attr(st));
-                            xml.push_str("\"></opc:RelationshipsGroupReference>");
+                        for st in unique_source_types(source_types) {
+                            push_empty_element(
+                                &mut xml,
+                                "opc:RelationshipsGroupReference",
+                                &format!(" SourceType=\"{}\"", xml_escape_attr(st)),
+                                self_closing,
+                            );
                         }
                         xml.push_str("</Transform>");
-                        // C14N is always appended after the RelationshipTransform.
-                        xml.push_str("<Transform Algorithm=\"");
-                        xml.push_str(C14N_URL);
-                        xml.push_str("\"></Transform>");
+                        push_empty_element(
+                            &mut xml,
+                            "Transform",
+                            &format!(" Algorithm=\"{C14N_URL}\""),
+                            self_closing,
+                        );
                     }
                 }
             }
             xml.push_str("</Transforms>");
         }
 
-        xml.push_str("<DigestMethod Algorithm=\"");
-        xml.push_str(&d.hash_uri);
-        xml.push_str("\"></DigestMethod>");
+        push_empty_element(
+            &mut xml,
+            "DigestMethod",
+            &format!(" Algorithm=\"{}\"", xml_escape_attr(&d.hash_uri)),
+            self_closing,
+        );
 
         xml.push_str("<DigestValue>");
         xml.push_str(&d.digest_b64);
@@ -285,7 +360,6 @@ fn build_object_xml(
 
     xml.push_str("</Manifest>");
 
-    // ── <SignatureProperties> ─────────────────────────────────────────────
     xml.push_str("<SignatureProperties>");
     xml.push_str("<SignatureProperty Id=\"idSignatureTime\" Target=\"#SignatureIdValue\">");
     xml.push_str("<SignatureTime xmlns=\"");
@@ -293,7 +367,6 @@ fn build_object_xml(
     xml.push_str("\">");
     xml.push_str("<Format>YYYY-MM-DDThh:mm:ss.sTZD</Format>");
     xml.push_str("<Value>");
-    // Format matching the C# code: "yyyy-MM-ddTHH:mm:ss.fzzz"
     xml.push_str(&signing_time.format("%Y-%m-%dT%H:%M:%S.0%:z").to_string());
     xml.push_str("</Value>");
     xml.push_str("</SignatureTime>");
@@ -301,12 +374,7 @@ fn build_object_xml(
     xml.push_str("</SignatureProperties>");
 
     xml.push_str("</Object>");
-
-    // C14N of this element (it is already in C14N-compatible form, but run
-    // through c14n() to ensure correct namespace handling and empty-element
-    // expansion).
-    let canonical = c14n(xml.as_bytes())?;
-    Ok(canonical)
+    xml
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -319,35 +387,44 @@ fn build_signed_info_xml(
     object_hash_b64: &str,
     digest_alg: DigestAlgorithm,
 ) -> Result<Vec<u8>> {
-    let xml = build_signed_info_inner_str(object_hash_b64, digest_alg);
-    let full = format!("<SignedInfo xmlns=\"{}\">{}</SignedInfo>", NS_DSIG, xml);
+    let xml = build_signed_info_inner_str(object_hash_b64, digest_alg, false);
+    let full = format!("<SignedInfo xmlns=\"{NS_DSIG}\">{xml}</SignedInfo>");
     c14n(full.as_bytes())
 }
 
-/// Build the inner content of `<SignedInfo>` (without the outer `<SignedInfo>`
-/// tags) as a string, ready for embedding in the final document.
+/// Build `<SignedInfo>` for embedding in the final document (self-closing empty
+/// elements, matching .NET XmlTextWriter output).
 fn build_signed_info_inner(object_hash_b64: &str, digest_alg: DigestAlgorithm) -> Vec<u8> {
-    let inner = build_signed_info_inner_str(object_hash_b64, digest_alg);
-    format!("<SignedInfo>{}</SignedInfo>", inner).into_bytes()
+    let inner = build_signed_info_inner_str(object_hash_b64, digest_alg, true);
+    format!("<SignedInfo>{inner}</SignedInfo>").into_bytes()
 }
 
-fn build_signed_info_inner_str(object_hash_b64: &str, digest_alg: DigestAlgorithm) -> String {
+fn build_signed_info_inner_str(
+    object_hash_b64: &str,
+    digest_alg: DigestAlgorithm,
+    self_closing: bool,
+) -> String {
     let mut s = String::new();
-    // <CanonicalizationMethod>
-    s.push_str("<CanonicalizationMethod Algorithm=\"");
-    s.push_str(C14N_URL);
-    s.push_str("\"></CanonicalizationMethod>");
-    // <SignatureMethod>
-    s.push_str("<SignatureMethod Algorithm=\"");
-    s.push_str(digest_alg.rsa_sig_uri());
-    s.push_str("\"></SignatureMethod>");
-    // <Reference> to the Object element.
-    s.push_str(
-        "<Reference Type=\"http://www.w3.org/2000/09/xmldsig#Object\" URI=\"#idPackageObject\">",
+    push_empty_element(
+        &mut s,
+        "CanonicalizationMethod",
+        &format!(" Algorithm=\"{C14N_URL}\""),
+        self_closing,
     );
-    s.push_str("<DigestMethod Algorithm=\"");
-    s.push_str(digest_alg.xml_uri());
-    s.push_str("\"></DigestMethod>");
+    push_empty_element(
+        &mut s,
+        "SignatureMethod",
+        &format!(" Algorithm=\"{}\"", digest_alg.rsa_sig_uri()),
+        self_closing,
+    );
+    // Attribute order matches XmlSignatureBuilder: URI before Type.
+    s.push_str("<Reference URI=\"#idPackageObject\" Type=\"http://www.w3.org/2000/09/xmldsig#Object\">");
+    push_empty_element(
+        &mut s,
+        "DigestMethod",
+        &format!(" Algorithm=\"{}\"", digest_alg.xml_uri()),
+        self_closing,
+    );
     s.push_str("<DigestValue>");
     s.push_str(object_hash_b64);
     s.push_str("</DigestValue>");
