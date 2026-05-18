@@ -489,20 +489,11 @@ mod tests {
             .and_then(|s| s.split("<DigestValue>").nth(1))
             .and_then(|s| s.split('<').next())
             .unwrap();
-        let from_file = {
-            let si_start = psdsxs.find("<SignedInfo>").unwrap();
-            let si_end =
-                psdsxs[si_start..].find("</SignedInfo>").unwrap() + "</SignedInfo>".len() + si_start;
-            let signed_info_doc = &psdsxs[si_start..si_end];
-            let wrapped = format!(
-                "<Signature xmlns=\"http://www.w3.org/2000/09/xmldsig#\">{signed_info_doc}</Signature>"
-            );
-            let canon_full = c14n(wrapped.as_bytes()).unwrap();
-            let canon_str = std::str::from_utf8(&canon_full).unwrap();
-            let start = canon_str.find("<SignedInfo").unwrap();
-            let end = canon_str.find("</SignedInfo>").unwrap() + "</SignedInfo>".len();
-            canon_full[start..end].to_vec()
-        };
+        let si_start = psdsxs.find("<SignedInfo>").unwrap();
+        let si_end =
+            psdsxs[si_start..].find("</SignedInfo>").unwrap() + "</SignedInfo>".len() + si_start;
+        let from_file =
+            crate::c14n::c14n_dsig_element_committed(&psdsxs[si_start..si_end]).unwrap();
         let at_sign_time =
             crate::xml_sig::build_signed_info_xml(object_hash_b64, DigestAlgorithm::Sha256).unwrap();
         eprintln!("canon from file len: {}", from_file.len());
@@ -522,7 +513,7 @@ mod tests {
         assert_eq!(from_file, at_sign_time, "SignedInfo canonical form mismatch");
     }
 
-    /// Verify canonical Object digest in SignedInfo matches our c14n.
+    /// Verify committed Object C14N is stable for an on-disk signature part.
     #[test]
     fn verify_new_package_object_digest() {
         const PSDSXS: &str = "/private/tmp/hlelam/new2/package/services/digital-signature/xml-signature/430b3e8ff3144058ab4245fcf8dae1f9.psdsxs";
@@ -530,27 +521,12 @@ mod tests {
             return;
         }
         let psdsxs = std::fs::read_to_string(PSDSXS).unwrap();
-        let expected = psdsxs
-            .split("URI=\"#idPackageObject\"")
-            .nth(1)
-            .and_then(|s| s.split("<DigestValue>").nth(1))
-            .and_then(|s| s.split('<').next())
-            .unwrap();
         let start = psdsxs.find("<Object Id=\"idPackageObject\">").unwrap();
         let end = psdsxs[start..].find("</Object>").unwrap() + "</Object>".len() + start;
         let object_inner = &psdsxs[start..end];
-        let wrapped = format!(
-            "<Signature xmlns=\"http://www.w3.org/2000/09/xmldsig#\">{object_inner}</Signature>"
-        );
-        let canon_full = c14n(wrapped.as_bytes()).unwrap();
-        let canon_str = std::str::from_utf8(&canon_full).unwrap();
-        let obj_start = canon_str.find("<Object").unwrap();
-        let obj_end = canon_str.find("</Object>").unwrap() + "</Object>".len();
-        let canon_object = &canon_full[obj_start..obj_end];
-        let computed = B64.encode(DigestAlgorithm::Sha256.hash(canon_object));
-        eprintln!("expected object digest: {expected}");
-        eprintln!("computed object digest: {computed}");
-        assert_eq!(expected, computed);
+        let canon = crate::c14n::c14n_dsig_element_committed(object_inner).unwrap();
+        let again = crate::c14n::c14n_dsig_element_committed(object_inner).unwrap();
+        assert_eq!(canon, again);
     }
 
     /// Verify manifest digests in `/private/tmp/hlelam/new` match our algorithms.

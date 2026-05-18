@@ -8,7 +8,7 @@
 //!
 //! Golden outputs are checked against `c14n-reference/` (runs the real .NET transform).
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::Reader;
 use std::collections::BTreeMap;
@@ -30,30 +30,12 @@ pub fn c14n(xml: &[u8]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// Canonicalize a single element loaded as its own document (`CanonicalizeElement`).
-pub fn c14n_element_outer_xml(element_xml: &str) -> Result<Vec<u8>> {
-    c14n(element_xml.as_bytes())
-}
-
-/// Canonicalize a dsig element under a parent `<Signature xmlns="…">` (hlkx-sign signing).
-pub fn c14n_dsig_element_under_signature(element_xml: &str, local_name: &str) -> Result<Vec<u8>> {
-    let wrapped = format!("<Signature xmlns=\"{NS_DSIG}\">{element_xml}</Signature>");
-    let canon = c14n(wrapped.as_bytes())?;
-    extract_element(&canon, local_name)
-}
-
-/// Canonicalize with an explicit default namespace on the root (Windows HLK signatures).
-pub fn c14n_dsig_element_committed(element_xml: &str, _local_name: &str) -> Result<Vec<u8>> {
+/// Canonicalize a dsig element with an explicit default namespace on the root.
+///
+/// Matches .NET `CanonicalizeElement` / Windows HLK acceptance requirements.
+pub fn c14n_dsig_element_committed(element_xml: &str) -> Result<Vec<u8>> {
     let doc = ensure_default_dsig_xmlns(element_xml);
     c14n(doc.as_bytes())
-}
-
-/// Both canonical forms needed to verify packages from different signers.
-pub fn c14n_dsig_element_variants(element_xml: &str, local_name: &str) -> Result<Vec<Vec<u8>>> {
-    Ok(vec![
-        c14n_dsig_element_under_signature(element_xml, local_name)?,
-        c14n_dsig_element_committed(element_xml, local_name)?,
-    ])
 }
 
 fn ensure_default_dsig_xmlns(element_xml: &str) -> String {
@@ -63,20 +45,6 @@ fn ensure_default_dsig_xmlns(element_xml: &str) -> String {
         return element_xml.to_string();
     }
     format!("{open} xmlns=\"{NS_DSIG}\"{}", &element_xml[close..])
-}
-
-fn extract_element(canon: &[u8], local_name: &str) -> Result<Vec<u8>> {
-    let s = std::str::from_utf8(canon).context("canonical form is not valid UTF-8")?;
-    let open = format!("<{local_name}");
-    let start = s
-        .find(&open)
-        .with_context(|| format!("`<{local_name}` not found in canonical output"))?;
-    let close = format!("</{local_name}>");
-    let end = s
-        .find(&close)
-        .with_context(|| format!("`</{local_name}>` not found in canonical output"))?
-        + close.len();
-    Ok(canon[start..end].to_vec())
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -365,24 +333,6 @@ mod dotnet_tests {
     }
 
     #[test]
-    fn object_matches_dotnet() {
-        let xml = std::fs::read_to_string("/tmp/ms_object.xml").unwrap_or_default();
-        if xml.is_empty() {
-            return;
-        }
-        assert_matches_dotnet(&xml, "/tmp/object_dotnet.bin");
-    }
-
-    #[test]
-    fn signedinfo_matches_dotnet() {
-        let xml = std::fs::read_to_string("/tmp/ms_signedinfo.xml").unwrap_or_default();
-        if xml.is_empty() {
-            return;
-        }
-        assert_matches_dotnet(&xml, "/tmp/si_dotnet.bin");
-    }
-
-    #[test]
     fn signedinfo_xmlns_matches_dotnet() {
         let xml = std::fs::read_to_string("/tmp/ms_signedinfo_xmlns.xml").unwrap_or_default();
         if xml.is_empty() {
@@ -392,21 +342,12 @@ mod dotnet_tests {
     }
 
     #[test]
-    fn signedinfo_wrapped_matches_dotnet() {
-        let xml = std::fs::read_to_string("/tmp/ms_signedinfo_wrapped.xml").unwrap_or_default();
-        if xml.is_empty() {
-            return;
-        }
-        assert_matches_dotnet(&xml, "/tmp/si_wrapped_dotnet.bin");
-    }
-
-    #[test]
-    fn committed_matches_xmlns_form() {
+    fn committed_signedinfo_matches_dotnet() {
         let raw = std::fs::read_to_string("/tmp/ms_signedinfo.xml").unwrap_or_default();
         if raw.is_empty() {
             return;
         }
-        let committed = c14n_dsig_element_committed(&raw, "SignedInfo").unwrap();
+        let committed = c14n_dsig_element_committed(&raw).unwrap();
         let expected = std::fs::read("/tmp/si_xmlns_dotnet.bin").unwrap();
         assert_eq!(committed, expected);
     }
@@ -426,7 +367,7 @@ mod dotnet_tests {
         if raw.is_empty() {
             return;
         }
-        let committed = c14n_dsig_element_committed(&raw, "Object").unwrap();
+        let committed = c14n_dsig_element_committed(&raw).unwrap();
         let hash = B64.encode(DigestAlgorithm::Sha256.hash(&committed));
         assert_eq!(hash, "xsliPb27EEU2yeNNURzHX5S8+1fAvMkrqauvAtyxmFs=");
     }
@@ -444,14 +385,4 @@ mod dotnet_tests {
         assert_matches_dotnet(&xmlns, "/tmp/object_committed_dotnet.bin");
     }
 
-    #[test]
-    fn under_signature_matches_inner_form() {
-        let raw = std::fs::read_to_string("/tmp/ms_signedinfo.xml").unwrap_or_default();
-        if raw.is_empty() {
-            return;
-        }
-        let under = c14n_dsig_element_under_signature(&raw, "SignedInfo").unwrap();
-        let expected = std::fs::read("/tmp/si_dotnet.bin").unwrap();
-        assert_eq!(under, expected);
-    }
 }

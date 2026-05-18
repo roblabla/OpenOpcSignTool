@@ -34,16 +34,16 @@ for tag in ("Object", "SignedInfo"):
 PY
 
 dotnet "$DOTNET_DLL" "$OUT/rels.xml" "$OUT/rels.c14n"
-dotnet "$DOTNET_DLL" "$OUT/object.xml" "$OUT/object.c14n"
-dotnet "$DOTNET_DLL" "$OUT/signedinfo.xml" "$OUT/signedinfo.c14n"
 
 SI="$OUT/signedinfo.xml"
+OBJ="$OUT/object.xml"
 python3 -c "
 s=open('$SI').read()
 open('$OUT/signedinfo_xmlns.xml','w').write(s.replace('<SignedInfo>', '<SignedInfo xmlns=\"http://www.w3.org/2000/09/xmldsig#\">', 1))
-open('$OUT/signedinfo_wrapped.xml','w').write('<Signature xmlns=\"http://www.w3.org/2000/09/xmldsig#\">'+s+'</Signature>')
+o=open('$OBJ').read()
+open('$OUT/object_xmlns.xml','w').write(o.replace('<Object Id=\"idPackageObject\">', '<Object Id=\"idPackageObject\" xmlns=\"http://www.w3.org/2000/09/xmldsig#\">', 1))
 "
 dotnet "$DOTNET_DLL" "$OUT/signedinfo_xmlns.xml" "$OUT/signedinfo_xmlns.c14n"
-dotnet "$DOTNET_DLL" "$OUT/signedinfo_wrapped.xml" "$OUT/signedinfo_wrapped.c14n"
+dotnet "$DOTNET_DLL" "$OUT/object_xmlns.xml" "$OUT/object_committed.c14n"
 
 echo "Wrote golden files to $OUT"

@@ -5,7 +5,7 @@
 //! matches the current package contents.  No certificate chain or trust-anchor
 //! validation is performed.
 
-use crate::c14n::{c14n, c14n_dsig_element_variants, c14n_element_outer_xml};
+use crate::c14n::{c14n, c14n_dsig_element_committed};
 use crate::opc::{
     entry_to_uri, normalize_relationship_target, parse_rels, rels_path_for_part, OpcPackage,
     OpcRelationship, GLOBAL_RELS, REL_DS_CERTIFICATE, REL_DS_ORIGIN, REL_DS_SIGNATURE,
@@ -101,14 +101,12 @@ fn verify_signature_xml(pkg: &OpcPackage, sig_xml: &[u8], cert_der: &[u8]) -> Re
     )?;
 
     // ── 2. SignedInfo digest of the package Object ────────────────────────
-    let object_ok = c14n_dsig_element_variants(&parsed.object_xml, "Object")?
-        .iter()
-        .chain(std::iter::once(&c14n_element_outer_xml(&parsed.object_xml)?))
-        .any(|c| B64.encode(digest_alg.hash(c)) == parsed.object_digest_b64);
-    if !object_ok {
+    let object_hash = B64.encode(digest_alg.hash(&c14n_dsig_element_committed(&parsed.object_xml)?));
+    if object_hash != parsed.object_digest_b64 {
         bail!(
-            "SignedInfo Object digest mismatch (expected {})",
-            parsed.object_digest_b64
+            "SignedInfo Object digest mismatch (expected {}, got {})",
+            parsed.object_digest_b64,
+            object_hash
         );
     }
 
@@ -333,12 +331,8 @@ fn verify_signed_info_signature(
     signed_info_xml: &str,
     signature: &[u8],
 ) -> Result<()> {
-    for canonical in c14n_dsig_element_variants(signed_info_xml, "SignedInfo")? {
-        if verify_signed_info_canonical(digest_alg, public_key, &canonical, signature).is_ok() {
-            return Ok(());
-        }
-    }
-    bail!("RSA signature over SignedInfo is invalid");
+    let canonical = c14n_dsig_element_committed(signed_info_xml)?;
+    verify_signed_info_canonical(digest_alg, public_key, &canonical, signature)
 }
 
 fn verify_signed_info_canonical(

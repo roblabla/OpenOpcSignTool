@@ -3,7 +3,7 @@
 //! The output matches the structure produced by the C# OpenVsixSignTool, which
 //! follows the OPC digital signature specification (ECMA-376 Part 2 §13).
 
-use crate::c14n::c14n_dsig_element_under_signature;
+use crate::c14n::c14n_dsig_element_committed;
 use crate::debug_log;
 use crate::opc::xml_escape_attr;
 use anyhow::{Context, Result};
@@ -269,7 +269,7 @@ fn build_object_xml(
     signing_time: DateTime<FixedOffset>,
 ) -> Result<(Vec<u8>, Vec<u8>)> {
     let inner = build_object_content(digests, signing_time, false);
-    let canonical = c14n_dsig_element_under_signature(&inner, "Object")?;
+    let canonical = c14n_dsig_element_committed(&inner)?;
     let document = build_object_content(digests, signing_time, true).into_bytes();
     Ok((canonical, document))
 }
@@ -390,9 +390,7 @@ pub(crate) fn build_signed_info_xml(
 ) -> Result<Vec<u8>> {
     let inner = build_signed_info_inner_str(object_hash_b64, digest_alg, false);
     let element = format!("<SignedInfo>{inner}</SignedInfo>");
-    // Canonicalize with the same parent context as in the final `.psdsxs` so the
-    // signed bytes match what Microsoft derives from `<Signature><SignedInfo>…`.
-    let canonical = c14n_dsig_element_under_signature(&element, "SignedInfo")?;
+    let canonical = c14n_dsig_element_committed(&element)?;
     // #region agent log
     debug_log::log(
         "E",
