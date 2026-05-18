@@ -1,6 +1,8 @@
 //! `hlkx-sign` – sign an HLKX (or VSIX) package with a PKCS#11 module.
 //!
 //! Usage:
+//!   hlkx-sign verify package.hlkx
+//!
 //!   hlkx-sign sign \
 //!     --pkcs11-module /usr/lib/opensc-pkcs11.so \
 //!     --pkcs11-cert "pkcs11:token=MyToken;object=MyCert;type=cert" \
@@ -21,6 +23,7 @@ mod opc;
 mod pkcs11;
 mod signing;
 mod timestamp;
+mod verification;
 mod xml_sig;
 
 use clap::{Parser, Subcommand};
@@ -39,6 +42,12 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Verify the digital signature on an HLKX/VSIX package.
+    Verify {
+        /// Path to the HLKX/VSIX file to verify.
+        file: String,
+    },
+
     /// Sign an HLKX/VSIX package.
     Sign {
         /// Path to the PKCS#11 shared library.
@@ -99,6 +108,20 @@ fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
+        Commands::Verify { file } => {
+            if !std::path::Path::new(&file).exists() {
+                anyhow::bail!("file not found: {}", file);
+            }
+
+            eprintln!("Opening package: {}", file);
+            let pkg = opc::OpcPackage::open(&file)?;
+
+            eprintln!("Verifying signature...");
+            verification::verify(&pkg)?;
+
+            eprintln!("Signature is valid.");
+        }
+
         Commands::Sign {
             pkcs11_module,
             pkcs11_cert,

@@ -3,7 +3,7 @@
 //! The output matches the structure produced by the C# OpenVsixSignTool, which
 //! follows the OPC digital signature specification (ECMA-376 Part 2 §13).
 
-use crate::c14n::c14n;
+use crate::c14n::c14n_dsig_element_under_signature;
 use crate::debug_log;
 use crate::opc::xml_escape_attr;
 use anyhow::{Context, Result};
@@ -20,22 +20,22 @@ const NS_DSIG: &str = "http://www.w3.org/2000/09/xmldsig#";
 const NS_OPC_DSIG: &str =
     "http://schemas.openxmlformats.org/package/2006/digital-signature";
 
-const C14N_URL: &str = "http://www.w3.org/TR/2001/REC-xml-c14n-20010315";
+pub(crate) const C14N_URL: &str = "http://www.w3.org/TR/2001/REC-xml-c14n-20010315";
 #[allow(dead_code)]
 const C14N_WITH_COMMENTS_URL: &str =
     "http://www.w3.org/TR/2001/REC-xml-c14n-20010315#WithComments";
-const REL_TRANSFORM_URL: &str =
+pub(crate) const REL_TRANSFORM_URL: &str =
     "http://schemas.openxmlformats.org/package/2006/RelationshipTransform";
 
-const RSA_SHA1_URL: &str = "http://www.w3.org/2000/09/xmldsig#rsa-sha1";
-const RSA_SHA256_URL: &str = "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256";
-const RSA_SHA384_URL: &str = "http://www.w3.org/2001/04/xmldsig-more#rsa-sha384";
-const RSA_SHA512_URL: &str = "http://www.w3.org/2001/04/xmldsig-more#rsa-sha512";
+pub(crate) const RSA_SHA1_URL: &str = "http://www.w3.org/2000/09/xmldsig#rsa-sha1";
+pub(crate) const RSA_SHA256_URL: &str = "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256";
+pub(crate) const RSA_SHA384_URL: &str = "http://www.w3.org/2001/04/xmldsig-more#rsa-sha384";
+pub(crate) const RSA_SHA512_URL: &str = "http://www.w3.org/2001/04/xmldsig-more#rsa-sha512";
 
-const SHA1_URL: &str = "http://www.w3.org/2000/09/xmldsig#sha1";
-const SHA256_URL: &str = "http://www.w3.org/2001/04/xmlenc#sha256";
-const SHA384_URL: &str = "http://www.w3.org/2001/04/xmldsig-more#sha384";
-const SHA512_URL: &str = "http://www.w3.org/2001/04/xmlenc#sha512";
+pub(crate) const SHA1_URL: &str = "http://www.w3.org/2000/09/xmldsig#sha1";
+pub(crate) const SHA256_URL: &str = "http://www.w3.org/2001/04/xmlenc#sha256";
+pub(crate) const SHA384_URL: &str = "http://www.w3.org/2001/04/xmldsig-more#sha384";
+pub(crate) const SHA512_URL: &str = "http://www.w3.org/2001/04/xmlenc#sha512";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Digest algorithm selector
@@ -126,7 +126,7 @@ pub struct PartDigest {
 }
 
 /// Describes a single transform in a `<Transforms>` block.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TransformInfo {
     /// `<Transform Algorithm="http://www.w3.org/TR/2001/REC-xml-c14n-20010315"/>`
     C14n,
@@ -262,27 +262,6 @@ fn push_empty_element(xml: &mut String, name: &str, attrs: &str, self_closing: b
     }
 }
 
-/// Canonicalize a dsig-namespaced element as it appears under `<Signature>`.
-fn c14n_dsig_element(inner: &str, local_name: &str) -> Result<Vec<u8>> {
-    let wrapped = format!("<Signature xmlns=\"{NS_DSIG}\">{inner}</Signature>");
-    let canon = c14n(wrapped.as_bytes())?;
-    extract_element(&canon, local_name)
-}
-
-fn extract_element(canon: &[u8], local_name: &str) -> Result<Vec<u8>> {
-    let s = std::str::from_utf8(canon).context("canonical form is not valid UTF-8")?;
-    let open = format!("<{local_name}");
-    let start = s
-        .find(&open)
-        .with_context(|| format!("`<{local_name}` not found in canonical output"))?;
-    let close = format!("</{local_name}>");
-    let end = s
-        .find(&close)
-        .with_context(|| format!("`</{local_name}>` not found in canonical output"))?
-        + close.len();
-    Ok(canon[start..end].to_vec())
-}
-
 /// Build `<Object Id="idPackageObject">` for hashing (C14N) and for the final
 /// `.psdsxs` document (self-closing empty tags, no redundant xmlns on Object).
 fn build_object_xml(
@@ -290,7 +269,7 @@ fn build_object_xml(
     signing_time: DateTime<FixedOffset>,
 ) -> Result<(Vec<u8>, Vec<u8>)> {
     let inner = build_object_content(digests, signing_time, false);
-    let canonical = c14n_dsig_element(&inner, "Object")?;
+    let canonical = c14n_dsig_element_under_signature(&inner, "Object")?;
     let document = build_object_content(digests, signing_time, true).into_bytes();
     Ok((canonical, document))
 }
@@ -413,7 +392,7 @@ pub(crate) fn build_signed_info_xml(
     let element = format!("<SignedInfo>{inner}</SignedInfo>");
     // Canonicalize with the same parent context as in the final `.psdsxs` so the
     // signed bytes match what Microsoft derives from `<Signature><SignedInfo>…`.
-    let canonical = c14n_dsig_element(&element, "SignedInfo")?;
+    let canonical = c14n_dsig_element_under_signature(&element, "SignedInfo")?;
     // #region agent log
     debug_log::log(
         "E",

@@ -264,7 +264,7 @@ pub fn sign(
 ///   - `[Content_Types].xml`
 ///   - existing digital-signature parts (origin, signatures, certificates)
 ///   - relationship files that belong to signature parts
-fn should_sign_part(path: &str) -> bool {
+pub(crate) fn should_sign_part(path: &str) -> bool {
     if path.eq_ignore_ascii_case(crate::opc::CONTENT_TYPES_XML) {
         return false;
     }
@@ -286,7 +286,7 @@ fn should_sign_part(path: &str) -> bool {
 /// Entry 1: C14N of the raw XML bytes.
 /// Entry 2: C14N of a filtered relationships document (the OPC
 ///          RelationshipTransform), excluding the origin relationship.
-fn digest_rels_part(
+pub(crate) fn digest_rels_part(
     part_path: &str,
     raw_xml: &[u8],
     mime: &str,
@@ -358,13 +358,16 @@ fn digest_rels_part(
             uri,
             digest_b64: B64.encode(&hash2),
             hash_uri: digest_alg.xml_uri().to_string(),
-            transforms: vec![TransformInfo::RelationshipTransform { source_types }],
+            transforms: vec![
+                TransformInfo::RelationshipTransform { source_types },
+                TransformInfo::C14n,
+            ],
         },
     ])
 }
 
 /// Distinct relationship `Type` values in first-seen order (relationships sorted by Id).
-fn unique_relationship_source_types(rels: &[&OpcRelationship]) -> Vec<String> {
+pub(crate) fn unique_relationship_source_types(rels: &[&OpcRelationship]) -> Vec<String> {
     let mut seen = HashSet::new();
     let mut out = Vec::new();
     for r in rels {
@@ -377,7 +380,7 @@ fn unique_relationship_source_types(rels: &[&OpcRelationship]) -> Vec<String> {
 
 /// Relationships to include in the RelationshipTransform digest, matching
 /// `OpcSignatureManifest.GetRelationships`.
-fn filtered_package_relationships(pkg: &OpcPackage) -> Vec<OpcRelationship> {
+pub(crate) fn filtered_package_relationships(pkg: &OpcPackage) -> Vec<OpcRelationship> {
     let mut by_id: BTreeMap<String, OpcRelationship> = BTreeMap::new();
     for rel in &pkg.pkg_rels {
         if is_digital_signature_origin_target(&rel.target) {
@@ -392,7 +395,7 @@ fn filtered_package_relationships(pkg: &OpcPackage) -> Vec<OpcRelationship> {
 /// Matches the output of `InternalRelationshipCollection.WriteRelationshipsAsXml`
 /// with `alwaysWriteTargetModeAttribute = true` (attribute order: Type, Target,
 /// TargetMode, Id).
-fn build_filtered_rels_xml(rels: &[&OpcRelationship]) -> String {
+pub(crate) fn build_filtered_rels_xml(rels: &[&OpcRelationship]) -> String {
     use crate::opc::xml_escape_attr;
     let mut s = String::new();
     s.push_str("<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">");

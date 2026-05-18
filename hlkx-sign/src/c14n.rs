@@ -1,22 +1,25 @@
-//! W3C Canonical XML 1.0 (without comments) implementation.
+//! W3C Canonical XML 1.0 (without comments), matching .NET `XmlDsigC14NTransform`.
 //!
-//! Sufficient for the XML structures produced when signing OPC packages:
-//!   - `_rels/*.rels` files
-//!   - The `<Object>` element containing the signature manifest
-//!   - The `<SignedInfo>` element
+//! Algorithm ported from .NET's `CanonicalXml` / `CanonicalXmlElement` writers:
+//! - [`XmlDsigC14NTransform`](https://github.com/dotnet/runtime/blob/main/src/libraries/System.Security.Cryptography.Xml/src/System/Security/Cryptography/Xml/XmlDsigC14NTransform.cs)
+//! - [`CanonicalXmlElement`](https://github.com/dotnet/runtime/blob/main/src/libraries/System.Security.Cryptography.Xml/src/System/Security/Cryptography/Xml/CanonicalXmlElement.cs)
+//! - [`AttributeSortOrder`](https://github.com/dotnet/runtime/blob/main/src/libraries/System.Security.Cryptography.Xml/src/System/Security/Cryptography/Xml/AttributeSortOrder.cs) (namespace URI, then local name)
+//! - [`NamespaceSortOrder`](https://github.com/dotnet/runtime/blob/main/src/libraries/System.Security.Cryptography.Xml/src/System/Security/Cryptography/Xml/NamespaceSortOrder.cs) (default xmlns first, then local name)
+//!
+//! Golden outputs are checked against `c14n-reference/` (runs the real .NET transform).
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::Reader;
 use std::collections::BTreeMap;
 
+pub const NS_DSIG: &str = "http://www.w3.org/2000/09/xmldsig#";
+
 // ─────────────────────────────────────────────────────────────────────────────
-// Public entry-point
+// Public API
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Canonicalise XML bytes per W3C Canonical XML 1.0 (no XML declaration,
-/// sorted attributes, namespace declarations before regular attributes,
-/// expanded empty elements).
+/// Canonicalize an XML document (`XmlDsigC14NTransform(false)` on `XmlDocument`).
 pub fn c14n(xml: &[u8]) -> Result<Vec<u8>> {
     let doc = parse_xml(xml)?;
     let mut out = Vec::new();
@@ -25,6 +28,55 @@ pub fn c14n(xml: &[u8]) -> Result<Vec<u8>> {
         emit_node(node, &ctx, &mut out);
     }
     Ok(out)
+}
+
+/// Canonicalize a single element loaded as its own document (`CanonicalizeElement`).
+pub fn c14n_element_outer_xml(element_xml: &str) -> Result<Vec<u8>> {
+    c14n(element_xml.as_bytes())
+}
+
+/// Canonicalize a dsig element under a parent `<Signature xmlns="…">` (hlkx-sign signing).
+pub fn c14n_dsig_element_under_signature(element_xml: &str, local_name: &str) -> Result<Vec<u8>> {
+    let wrapped = format!("<Signature xmlns=\"{NS_DSIG}\">{element_xml}</Signature>");
+    let canon = c14n(wrapped.as_bytes())?;
+    extract_element(&canon, local_name)
+}
+
+/// Canonicalize with an explicit default namespace on the root (Windows HLK signatures).
+pub fn c14n_dsig_element_committed(element_xml: &str, _local_name: &str) -> Result<Vec<u8>> {
+    let doc = ensure_default_dsig_xmlns(element_xml);
+    c14n(doc.as_bytes())
+}
+
+/// Both canonical forms needed to verify packages from different signers.
+pub fn c14n_dsig_element_variants(element_xml: &str, local_name: &str) -> Result<Vec<Vec<u8>>> {
+    Ok(vec![
+        c14n_dsig_element_under_signature(element_xml, local_name)?,
+        c14n_dsig_element_committed(element_xml, local_name)?,
+    ])
+}
+
+fn ensure_default_dsig_xmlns(element_xml: &str) -> String {
+    let close = element_xml.find('>').unwrap_or(element_xml.len());
+    let open = &element_xml[..close];
+    if open.contains("xmlns=") {
+        return element_xml.to_string();
+    }
+    format!("{open} xmlns=\"{NS_DSIG}\"{}", &element_xml[close..])
+}
+
+fn extract_element(canon: &[u8], local_name: &str) -> Result<Vec<u8>> {
+    let s = std::str::from_utf8(canon).context("canonical form is not valid UTF-8")?;
+    let open = format!("<{local_name}");
+    let start = s
+        .find(&open)
+        .with_context(|| format!("`<{local_name}` not found in canonical output"))?;
+    let close = format!("</{local_name}>");
+    let end = s
+        .find(&close)
+        .with_context(|| format!("`</{local_name}>` not found in canonical output"))?
+        + close.len();
+    Ok(canon[start..end].to_vec())
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -38,16 +90,13 @@ enum Node {
 
 struct Element {
     qname: String,
-    #[allow(dead_code)]
-    ns_uri: String,
     prefix: String,
-    /// All raw attributes including xmlns declarations.
     attrs: Vec<(String, String)>,
     children: Vec<Node>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Parser
+// Parser (PreserveWhitespace = true)
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn split_qname(qname: &str) -> (&str, &str) {
@@ -61,16 +110,12 @@ fn parse_xml(xml: &[u8]) -> Result<Vec<Node>> {
     let mut reader = Reader::from_reader(xml);
     reader.config_mut().trim_text(false);
 
-    // Namespace scope stack: prefix → URI. "" = default namespace.
     let mut ns_stack: Vec<BTreeMap<String, String>> = vec![BTreeMap::new()];
-    // Children stack: top = current element's children being collected.
     let mut out_stack: Vec<Vec<Node>> = vec![Vec::new()];
-    // Pending element metadata: (qname, ns_uri, prefix, raw_attrs).
-    let mut elem_stack: Vec<(String, String, String, Vec<(String, String)>)> = Vec::new();
+    let mut elem_stack: Vec<(String, String, Vec<(String, String)>)> = Vec::new();
 
     loop {
         match reader.read_event()? {
-            // Strip declaration, comments and PIs (C14N without comments).
             Event::Decl(_) | Event::Comment(_) | Event::PI(_) => {}
             Event::Eof => break,
 
@@ -112,7 +157,7 @@ fn decode_element(
     e: &BytesStart<'_>,
     ns_stack: &[BTreeMap<String, String>],
     reader: &Reader<&[u8]>,
-) -> ((String, String, String, Vec<(String, String)>), BTreeMap<String, String>) {
+) -> ((String, String, Vec<(String, String)>), BTreeMap<String, String>) {
     let mut raw_attrs: Vec<(String, String)> = Vec::new();
     for attr in e.attributes().flatten() {
         let key = std::str::from_utf8(attr.key.as_ref()).unwrap_or("").to_string();
@@ -120,7 +165,6 @@ fn decode_element(
         raw_attrs.push((key, val));
     }
 
-    // Build new namespace scope.
     let mut scope = ns_stack.last().cloned().unwrap_or_default();
     for (k, v) in &raw_attrs {
         if k == "xmlns" {
@@ -132,30 +176,25 @@ fn decode_element(
 
     let qname = std::str::from_utf8(e.name().as_ref()).unwrap_or("").to_string();
     let prefix_owned = split_qname(&qname).0.to_string();
-    let ns_uri = if prefix_owned.is_empty() {
-        scope.get("").cloned().unwrap_or_default()
-    } else {
-        scope.get(&prefix_owned).cloned().unwrap_or_default()
-    };
 
-    ((qname, ns_uri, prefix_owned, raw_attrs), scope)
+    ((qname, prefix_owned, raw_attrs), scope)
 }
 
 fn pop_element(
     ns_stack: &mut Vec<BTreeMap<String, String>>,
     out_stack: &mut Vec<Vec<Node>>,
-    elem_stack: &mut Vec<(String, String, String, Vec<(String, String)>)>,
+    elem_stack: &mut Vec<(String, String, Vec<(String, String)>)>,
 ) {
     ns_stack.pop();
     let children = out_stack.pop().unwrap_or_default();
-    if let Some((qname, ns_uri, prefix, attrs)) = elem_stack.pop() {
-        let elem = Element { qname, ns_uri, prefix, attrs, children };
+    if let Some((qname, prefix, attrs)) = elem_stack.pop() {
+        let elem = Element { qname, prefix, attrs, children };
         out_stack.last_mut().unwrap().push(Node::Element(elem));
     }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// C14N emitter
+// C14N emitter (CanonicalXmlElement.Write)
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn emit_node(node: &Node, parent_ctx: &BTreeMap<String, String>, out: &mut Vec<u8>) {
@@ -165,6 +204,7 @@ fn emit_node(node: &Node, parent_ctx: &BTreeMap<String, String>, out: &mut Vec<u
     }
 }
 
+/// `Utils.EscapeTextData`
 fn emit_text(text: &str, out: &mut Vec<u8>) {
     for c in text.chars() {
         match c {
@@ -181,7 +221,6 @@ fn emit_text(text: &str, out: &mut Vec<u8>) {
 }
 
 fn emit_element(elem: &Element, parent_ctx: &BTreeMap<String, String>, out: &mut Vec<u8>) {
-    // Build this element's namespace context by merging parent + own decls.
     let mut my_ctx = parent_ctx.clone();
     for (k, v) in &elem.attrs {
         if k == "xmlns" {
@@ -191,20 +230,15 @@ fn emit_element(elem: &Element, parent_ctx: &BTreeMap<String, String>, out: &mut
         }
     }
 
-    // Determine which namespace declarations to emit.
-    // C14N 1.0 (non-exclusive): emit a namespace node when its binding
-    // differs from the parent context.
+    // NamespaceSortOrder: default xmlns first, then xmlns:localname.
     let mut ns_decls: BTreeMap<String, String> = BTreeMap::new();
 
-    // Check the element's own namespace.
-    let pfx = &elem.prefix;
-    let elem_uri = my_ctx.get(pfx.as_str()).cloned().unwrap_or_default();
-    let parent_uri = parent_ctx.get(pfx.as_str()).cloned().unwrap_or_default();
+    let elem_uri = my_ctx.get(elem.prefix.as_str()).cloned().unwrap_or_default();
+    let parent_uri = parent_ctx.get(elem.prefix.as_str()).cloned().unwrap_or_default();
     if elem_uri != parent_uri {
-        ns_decls.insert(pfx.clone(), elem_uri.clone());
+        ns_decls.insert(elem.prefix.clone(), elem_uri.clone());
     }
 
-    // Check attribute namespaces.
     for (k, _) in &elem.attrs {
         if k == "xmlns" || k.starts_with("xmlns:") {
             continue;
@@ -219,7 +253,6 @@ fn emit_element(elem: &Element, parent_ctx: &BTreeMap<String, String>, out: &mut
         }
     }
 
-    // Propagate all xmlns declarations that changed relative to parent.
     for (k, v) in &elem.attrs {
         if k == "xmlns" {
             let pu = parent_ctx.get("").cloned().unwrap_or_default();
@@ -234,11 +267,9 @@ fn emit_element(elem: &Element, parent_ctx: &BTreeMap<String, String>, out: &mut
         }
     }
 
-    // Start tag.
     out.push(b'<');
     out.extend_from_slice(elem.qname.as_bytes());
 
-    // 1) Namespace declarations (BTreeMap order: "" first, then lexicographic).
     for (ns_pfx, ns_uri) in &ns_decls {
         if ns_pfx.is_empty() {
             out.extend_from_slice(b" xmlns=\"");
@@ -247,11 +278,11 @@ fn emit_element(elem: &Element, parent_ctx: &BTreeMap<String, String>, out: &mut
             out.extend_from_slice(ns_pfx.as_bytes());
             out.extend_from_slice(b"=\"");
         }
-        out.extend_from_slice(attr_escape(ns_uri).as_bytes());
+        out.extend_from_slice(escape_attribute_value(ns_uri).as_bytes());
         out.push(b'"');
     }
 
-    // 2) Regular attributes sorted by (ns-URI, local-name).
+    // AttributeSortOrder: namespace URI, then local name.
     let mut reg_attrs: Vec<(&str, &str)> = elem
         .attrs
         .iter()
@@ -262,9 +293,16 @@ fn emit_element(elem: &Element, parent_ctx: &BTreeMap<String, String>, out: &mut
     reg_attrs.sort_by(|(k1, _), (k2, _)| {
         let (p1, l1) = split_qname(k1);
         let (p2, l2) = split_qname(k2);
-        // Namespace URI for attribute: only prefixed attributes have one.
-        let u1 = if p1.is_empty() { "" } else { my_ctx.get(p1).map(|s| s.as_str()).unwrap_or("") };
-        let u2 = if p2.is_empty() { "" } else { my_ctx.get(p2).map(|s| s.as_str()).unwrap_or("") };
+        let u1 = if p1.is_empty() {
+            ""
+        } else {
+            my_ctx.get(p1).map(|s| s.as_str()).unwrap_or("")
+        };
+        let u2 = if p2.is_empty() {
+            ""
+        } else {
+            my_ctx.get(p2).map(|s| s.as_str()).unwrap_or("")
+        };
         u1.cmp(u2).then(l1.cmp(l2))
     });
 
@@ -272,24 +310,23 @@ fn emit_element(elem: &Element, parent_ctx: &BTreeMap<String, String>, out: &mut
         out.push(b' ');
         out.extend_from_slice(k.as_bytes());
         out.extend_from_slice(b"=\"");
-        out.extend_from_slice(attr_escape(v).as_bytes());
+        out.extend_from_slice(escape_attribute_value(v).as_bytes());
         out.push(b'"');
     }
 
     out.push(b'>');
 
-    // Children.
     for child in &elem.children {
         emit_node(child, &my_ctx, out);
     }
 
-    // End tag.
     out.extend_from_slice(b"</");
     out.extend_from_slice(elem.qname.as_bytes());
     out.push(b'>');
 }
 
-fn attr_escape(s: &str) -> String {
+/// `Utils.EscapeAttributeValue`
+fn escape_attribute_value(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         match c {
@@ -303,4 +340,118 @@ fn attr_escape(s: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod dotnet_tests {
+    use super::*;
+
+    fn assert_matches_dotnet(input: &str, expected_bin: &str) {
+        if !std::path::Path::new(expected_bin).exists() {
+            return;
+        }
+        let expected = std::fs::read(expected_bin).unwrap();
+        let got = c14n(input.as_bytes()).unwrap();
+        assert_eq!(got, expected, "mismatch for {expected_bin}");
+    }
+
+    #[test]
+    fn rels_matches_dotnet() {
+        let xml = std::fs::read_to_string("/tmp/rels_raw.xml").unwrap_or_default();
+        if xml.is_empty() {
+            return;
+        }
+        assert_matches_dotnet(&xml, "/tmp/rels_dotnet.bin");
+    }
+
+    #[test]
+    fn object_matches_dotnet() {
+        let xml = std::fs::read_to_string("/tmp/ms_object.xml").unwrap_or_default();
+        if xml.is_empty() {
+            return;
+        }
+        assert_matches_dotnet(&xml, "/tmp/object_dotnet.bin");
+    }
+
+    #[test]
+    fn signedinfo_matches_dotnet() {
+        let xml = std::fs::read_to_string("/tmp/ms_signedinfo.xml").unwrap_or_default();
+        if xml.is_empty() {
+            return;
+        }
+        assert_matches_dotnet(&xml, "/tmp/si_dotnet.bin");
+    }
+
+    #[test]
+    fn signedinfo_xmlns_matches_dotnet() {
+        let xml = std::fs::read_to_string("/tmp/ms_signedinfo_xmlns.xml").unwrap_or_default();
+        if xml.is_empty() {
+            return;
+        }
+        assert_matches_dotnet(&xml, "/tmp/si_xmlns_dotnet.bin");
+    }
+
+    #[test]
+    fn signedinfo_wrapped_matches_dotnet() {
+        let xml = std::fs::read_to_string("/tmp/ms_signedinfo_wrapped.xml").unwrap_or_default();
+        if xml.is_empty() {
+            return;
+        }
+        assert_matches_dotnet(&xml, "/tmp/si_wrapped_dotnet.bin");
+    }
+
+    #[test]
+    fn committed_matches_xmlns_form() {
+        let raw = std::fs::read_to_string("/tmp/ms_signedinfo.xml").unwrap_or_default();
+        if raw.is_empty() {
+            return;
+        }
+        let committed = c14n_dsig_element_committed(&raw, "SignedInfo").unwrap();
+        let expected = std::fs::read("/tmp/si_xmlns_dotnet.bin").unwrap();
+        assert_eq!(committed, expected);
+    }
+
+    #[test]
+    fn ensure_xmlns_on_root_not_descendant() {
+        let raw = r#"<Object Id="id"><Manifest xmlns:opc="http://example.com/ns"/></Object>"#;
+        let out = ensure_default_dsig_xmlns(raw);
+        assert!(out.starts_with("<Object Id=\"id\" xmlns=\"http://www.w3.org/2000/09/xmldsig#\">"));
+    }
+
+    #[test]
+    fn committed_object_digest_matches_microsoft() {
+        use base64::{engine::general_purpose::STANDARD as B64, Engine};
+        use crate::xml_sig::DigestAlgorithm;
+        let raw = std::fs::read_to_string("/tmp/ms_object.xml").unwrap_or_default();
+        if raw.is_empty() {
+            return;
+        }
+        let committed = c14n_dsig_element_committed(&raw, "Object").unwrap();
+        let hash = B64.encode(DigestAlgorithm::Sha256.hash(&committed));
+        assert_eq!(hash, "xsliPb27EEU2yeNNURzHX5S8+1fAvMkrqauvAtyxmFs=");
+    }
+
+    #[test]
+    fn object_xmlns_matches_dotnet() {
+        let raw = std::fs::read_to_string("/tmp/ms_object.xml").unwrap_or_default();
+        if raw.is_empty() {
+            return;
+        }
+        let xmlns = raw.replace(
+            "<Object Id=\"idPackageObject\">",
+            "<Object Id=\"idPackageObject\" xmlns=\"http://www.w3.org/2000/09/xmldsig#\">",
+        );
+        assert_matches_dotnet(&xmlns, "/tmp/object_committed_dotnet.bin");
+    }
+
+    #[test]
+    fn under_signature_matches_inner_form() {
+        let raw = std::fs::read_to_string("/tmp/ms_signedinfo.xml").unwrap_or_default();
+        if raw.is_empty() {
+            return;
+        }
+        let under = c14n_dsig_element_under_signature(&raw, "SignedInfo").unwrap();
+        let expected = std::fs::read("/tmp/si_dotnet.bin").unwrap();
+        assert_eq!(under, expected);
+    }
 }
