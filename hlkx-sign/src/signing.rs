@@ -10,6 +10,7 @@
 //!     files back into the package.
 
 use crate::c14n::c14n;
+use crate::debug_log;
 use crate::opc::{
     entry_to_uri, extension_for_opc_content_type, is_digital_signature_origin_target,
     rels_path_for_part, serialize_rels, OpcPackage, OpcRelationship, MIME_DS_CERTIFICATE,
@@ -176,6 +177,18 @@ pub fn sign(
 
     // Sort by URI (case-insensitive, matching the C# sort).
     all_digests.sort_by(|a, b| a.uri.to_lowercase().cmp(&b.uri.to_lowercase()));
+    // #region agent log
+    debug_log::log(
+        "A",
+        "signing.rs:sign",
+        "digest manifest summary",
+        &format!(
+            r#"{{"digest_count":{},"uris":{:?}}}"#,
+            all_digests.len(),
+            all_digests.iter().map(|d| &d.uri).collect::<Vec<_>>()
+        ),
+    );
+    // #endregion
 
     // ── Step 6: Build the XML signature ───────────────────────────────────
     let signing_time = Local::now().fixed_offset();
@@ -254,6 +267,19 @@ fn digest_rels_part(
     // ── Entry 1: C14N of the raw XML ──────────────────────────────────────
     let c14n_raw = c14n(raw_xml)?;
     let hash1 = digest_alg.hash(&c14n_raw);
+    // #region agent log
+    debug_log::log(
+        "B",
+        "signing.rs:digest_rels_part",
+        "rels c14n digest",
+        &format!(
+            r#"{{"hash1_b64":"{}","c14n_len":{},"raw_len":{}}}"#,
+            B64.encode(&hash1),
+            c14n_raw.len(),
+            raw_xml.len()
+        ),
+    );
+    // #endregion
 
     // ── Entry 2: RelationshipTransform + C14N ─────────────────────────────
     // Build a sorted filtered relationships document (mirrors
@@ -267,6 +293,20 @@ fn digest_rels_part(
     let filtered_xml = build_filtered_rels_xml(&filtered_refs);
     let c14n_filtered = c14n(filtered_xml.as_bytes())?;
     let hash2 = digest_alg.hash(&c14n_filtered);
+    // #region agent log
+    debug_log::log(
+        "C",
+        "signing.rs:digest_rels_part",
+        "filtered rels digest",
+        &format!(
+            r#"{{"hash2_b64":"{}","filtered_count":{},"source_type_count":{},"filtered_xml_len":{}}}"#,
+            B64.encode(&hash2),
+            filtered.len(),
+            filtered_refs.len(),
+            filtered_xml.len()
+        ),
+    );
+    // #endregion
 
     // One RelationshipsGroupReference per filtered relationship (same order as C#
     // `XmlSignatureBuilder` iterating `nodes` from the filtered relationships doc).
@@ -329,8 +369,8 @@ fn build_filtered_rels_xml(rels: &[&OpcRelationship]) -> String {
 mod tests {
     use super::*;
     use crate::opc::{
-        is_digital_signature_origin_target, normalize_relationship_target, DS_ORIGIN_PART_PATH,
-        DS_ORIGIN_PART_URI, MIME_OCTET,
+        is_digital_signature_origin_target, normalize_relationship_target, parse_rels,
+        DS_ORIGIN_PART_PATH, DS_ORIGIN_PART_URI, MIME_OCTET,
     };
     use std::collections::HashMap;
 
@@ -352,6 +392,167 @@ mod tests {
         assert!(is_digital_signature_origin_target(DS_ORIGIN_PART_URI));
         assert!(is_digital_signature_origin_target(DS_ORIGIN_PART_PATH));
         assert!(!is_digital_signature_origin_target("/hck/data/foo"));
+    }
+
+    /// Verify canonical SignedInfo from on-disk psdsxs matches signing-time c14n.
+    #[test]
+    fn verify_new_package_signed_info_canonicalization() {
+        const PSDSXS: &str = "/private/tmp/hlelam/new/package/services/digital-signature/xml-signature/891c120eb4864a56a36f5039be7b3734.psdsxs";
+        if !std::path::Path::new(PSDSXS).exists() {
+            return;
+        }
+        let psdsxs = std::fs::read_to_string(PSDSXS).unwrap();
+        let object_hash_b64 = psdsxs
+            .split("URI=\"#idPackageObject\"")
+            .nth(1)
+            .and_then(|s| s.split("<DigestValue>").nth(1))
+            .and_then(|s| s.split('<').next())
+            .unwrap();
+        let from_file = {
+            let si_start = psdsxs.find("<SignedInfo>").unwrap();
+            let si_end =
+                psdsxs[si_start..].find("</SignedInfo>").unwrap() + "</SignedInfo>".len() + si_start;
+            let signed_info_doc = &psdsxs[si_start..si_end];
+            let wrapped = format!(
+                "<Signature xmlns=\"http://www.w3.org/2000/09/xmldsig#\">{signed_info_doc}</Signature>"
+            );
+            let canon_full = c14n(wrapped.as_bytes()).unwrap();
+            let canon_str = std::str::from_utf8(&canon_full).unwrap();
+            let start = canon_str.find("<SignedInfo").unwrap();
+            let end = canon_str.find("</SignedInfo>").unwrap() + "</SignedInfo>".len();
+            canon_full[start..end].to_vec()
+        };
+        let at_sign_time =
+            crate::xml_sig::build_signed_info_xml(object_hash_b64, DigestAlgorithm::Sha256).unwrap();
+        eprintln!("canon from file len: {}", from_file.len());
+        eprintln!("canon at sign len: {}", at_sign_time.len());
+        if from_file != at_sign_time {
+            let fs = std::str::from_utf8(&from_file).unwrap();
+            let ss = std::str::from_utf8(&at_sign_time).unwrap();
+            for (i, (a, b)) in fs.bytes().zip(ss.bytes()).enumerate() {
+                if a != b {
+                    eprintln!("first diff at {i}: file={a:02x} sign={b:02x}");
+                    eprintln!("file context: {:?}", &fs[i.saturating_sub(20)..(i + 40).min(fs.len())]);
+                    eprintln!("sign context: {:?}", &ss[i.saturating_sub(20)..(i + 40).min(ss.len())]);
+                    break;
+                }
+            }
+        }
+        assert_eq!(from_file, at_sign_time, "SignedInfo canonical form mismatch");
+    }
+
+    /// Verify canonical Object digest in SignedInfo matches our c14n.
+    #[test]
+    fn verify_new_package_object_digest() {
+        const PSDSXS: &str = "/private/tmp/hlelam/new/package/services/digital-signature/xml-signature/891c120eb4864a56a36f5039be7b3734.psdsxs";
+        if !std::path::Path::new(PSDSXS).exists() {
+            return;
+        }
+        let psdsxs = std::fs::read_to_string(PSDSXS).unwrap();
+        let expected = psdsxs
+            .split("URI=\"#idPackageObject\"")
+            .nth(1)
+            .and_then(|s| s.split("<DigestValue>").nth(1))
+            .and_then(|s| s.split('<').next())
+            .unwrap();
+        let start = psdsxs.find("<Object Id=\"idPackageObject\">").unwrap();
+        let end = psdsxs[start..].find("</Object>").unwrap() + "</Object>".len() + start;
+        let object_inner = &psdsxs[start..end];
+        let wrapped = format!(
+            "<Signature xmlns=\"http://www.w3.org/2000/09/xmldsig#\">{object_inner}</Signature>"
+        );
+        let canon_full = c14n(wrapped.as_bytes()).unwrap();
+        let canon_str = std::str::from_utf8(&canon_full).unwrap();
+        let obj_start = canon_str.find("<Object").unwrap();
+        let obj_end = canon_str.find("</Object>").unwrap() + "</Object>".len();
+        let canon_object = &canon_full[obj_start..obj_end];
+        let computed = B64.encode(DigestAlgorithm::Sha256.hash(canon_object));
+        eprintln!("expected object digest: {expected}");
+        eprintln!("computed object digest: {computed}");
+        assert_eq!(expected, computed);
+    }
+
+    /// Verify manifest digests in `/private/tmp/hlelam/new` match our algorithms.
+    #[test]
+    fn verify_new_package_manifest_digests() {
+        const PKG: &str = "/private/tmp/hlelam/new";
+        const PSDSXS: &str = "/private/tmp/hlelam/new/package/services/digital-signature/xml-signature/891c120eb4864a56a36f5039be7b3734.psdsxs";
+        if !std::path::Path::new(PSDSXS).exists() {
+            eprintln!("skip verify_new_package_manifest_digests: package not present");
+            return;
+        }
+        let psdsxs = std::fs::read_to_string(PSDSXS).unwrap();
+        let manifest_rels: Vec<(&str, &str)> = psdsxs
+            .split("<Reference URI=\"")
+            .skip(1)
+            .filter_map(|chunk| {
+                let uri = chunk.split('"').next()?;
+                if uri.starts_with('#') {
+                    return None;
+                }
+                let dv = chunk.split("<DigestValue>").nth(1)?.split('<').next()?;
+                Some((uri, dv))
+            })
+            .collect();
+
+        let rels_raw = std::fs::read(format!("{PKG}/_rels/.rels")).unwrap();
+        let c14n_rels = c14n(&rels_raw).unwrap();
+        let hash_rels = B64.encode(DigestAlgorithm::Sha256.hash(&c14n_rels));
+
+        let pkg_rels = parse_rels(&rels_raw).unwrap();
+        let pkg = OpcPackage {
+            path: std::path::PathBuf::from(PKG),
+            entries: HashMap::new(),
+            content_types: vec![],
+            pkg_rels,
+        };
+        let filtered = filtered_package_relationships(&pkg);
+        let filtered_refs: Vec<&OpcRelationship> = filtered.iter().collect();
+        let filtered_xml = build_filtered_rels_xml(&filtered_refs);
+        let c14n_filt = c14n(filtered_xml.as_bytes()).unwrap();
+        let hash_filt = B64.encode(DigestAlgorithm::Sha256.hash(&c14n_filt));
+
+        let mut mismatches = Vec::new();
+        for (uri, expected) in &manifest_rels {
+            if uri.contains("_rels/.rels") {
+                continue;
+            }
+            let path = uri.split('?').next().unwrap().trim_start_matches('/');
+            let full = format!("{PKG}/{path}");
+            if !std::path::Path::new(&full).exists() {
+                continue;
+            }
+            let raw = std::fs::read(&full).unwrap();
+            let computed = B64.encode(DigestAlgorithm::Sha256.hash(&raw));
+            if computed != *expected {
+                mismatches.push(format!("{path}: expected {expected} got {computed}"));
+            }
+        }
+
+        eprintln!("manifest rels entries: {}", manifest_rels.len());
+        eprintln!("c14n _rels/.rels: {hash_rels}");
+        eprintln!("c14n filtered rels: {hash_filt}");
+        for (uri, dv) in &manifest_rels {
+            if uri.contains("_rels/.rels") {
+                eprintln!("manifest _rels digest in file: {dv}");
+            }
+        }
+        // Find both _rels digests in manifest
+        let rels_digests: Vec<&str> = manifest_rels
+            .iter()
+            .filter(|(u, _)| u.contains("_rels/.rels"))
+            .map(|(_, d)| *d)
+            .collect();
+        eprintln!("manifest _rels digests: {:?}", rels_digests);
+        eprintln!("computed c14n raw rels matches first? {}", rels_digests.first() == Some(&hash_rels.as_str()));
+        eprintln!("computed filtered matches second? {}", rels_digests.get(1) == Some(&hash_filt.as_str()));
+
+        assert!(
+            mismatches.is_empty(),
+            "raw part digest mismatches: {mismatches:?}"
+        );
+        assert_eq!(rels_digests.first(), Some(&hash_rels.as_str()));
+        assert_eq!(rels_digests.get(1), Some(&hash_filt.as_str()));
     }
 
     #[test]

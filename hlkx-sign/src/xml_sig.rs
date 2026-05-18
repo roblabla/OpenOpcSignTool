@@ -4,9 +4,9 @@
 //! follows the OPC digital signature specification (ECMA-376 Part 2 §13).
 
 use crate::c14n::c14n;
+use crate::debug_log;
 use crate::opc::xml_escape_attr;
 use anyhow::{Context, Result};
-use std::collections::HashSet;
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use chrono::{DateTime, FixedOffset};
 use sha1::Digest as Sha1Digest;
@@ -167,6 +167,19 @@ pub fn build_signature_xml(
     // ── 2. Hash the canonical <Object> ──────────────────────────────────
     let object_hash = digest_alg.hash(&object_canonical);
     let object_hash_b64 = B64.encode(&object_hash);
+    // #region agent log
+    debug_log::log(
+        "D",
+        "xml_sig.rs:build_signature_xml",
+        "object canonical digest",
+        &format!(
+            r#"{{"object_hash_b64":"{}","canonical_len":{},"document_len":{}}}"#,
+            object_hash_b64,
+            object_canonical.len(),
+            object_document.len()
+        ),
+    );
+    // #endregion
 
     // ── 3. Build the canonical <SignedInfo> and sign it ──────────────────
     let signed_info_xml =
@@ -241,25 +254,11 @@ fn push_empty_element(xml: &mut String, name: &str, attrs: &str, self_closing: b
     }
 }
 
-/// One `RelationshipsGroupReference` per distinct `SourceType`, preserving the
-/// first-seen order (matches Microsoft OPC tooling; duplicate selectors are
-/// redundant for the RelationshipTransform).
-fn unique_source_types(source_types: &[String]) -> Vec<&str> {
-    let mut seen = HashSet::new();
-    let mut out = Vec::new();
-    for st in source_types {
-        if seen.insert(st.as_str()) {
-            out.push(st.as_str());
-        }
-    }
-    out
-}
-
-/// Canonicalize a dsig-namespaced fragment that will live under `<Signature>`.
-fn c14n_dsig_fragment(inner: &str) -> Result<Vec<u8>> {
+/// Canonicalize a dsig-namespaced element as it appears under `<Signature>`.
+fn c14n_dsig_element(inner: &str, local_name: &str) -> Result<Vec<u8>> {
     let wrapped = format!("<Signature xmlns=\"{NS_DSIG}\">{inner}</Signature>");
     let canon = c14n(wrapped.as_bytes())?;
-    extract_element(&canon, "Object")
+    extract_element(&canon, local_name)
 }
 
 fn extract_element(canon: &[u8], local_name: &str) -> Result<Vec<u8>> {
@@ -283,7 +282,7 @@ fn build_object_xml(
     signing_time: DateTime<FixedOffset>,
 ) -> Result<(Vec<u8>, Vec<u8>)> {
     let inner = build_object_content(digests, signing_time, false);
-    let canonical = c14n_dsig_fragment(&inner)?;
+    let canonical = c14n_dsig_element(&inner, "Object")?;
     let document = build_object_content(digests, signing_time, true).into_bytes();
     Ok((canonical, document))
 }
@@ -323,7 +322,7 @@ fn build_object_content(
                         xml.push_str("<Transform Algorithm=\"");
                         xml.push_str(REL_TRANSFORM_URL);
                         xml.push_str("\">");
-                        for st in unique_source_types(source_types) {
+                        for st in source_types {
                             push_empty_element(
                                 &mut xml,
                                 "opc:RelationshipsGroupReference",
@@ -383,13 +382,24 @@ fn build_object_content(
 
 /// Build the canonical `<SignedInfo>` bytes (used both for hashing/signing and
 /// for embedding in the final document).
-fn build_signed_info_xml(
+pub(crate) fn build_signed_info_xml(
     object_hash_b64: &str,
     digest_alg: DigestAlgorithm,
 ) -> Result<Vec<u8>> {
-    let xml = build_signed_info_inner_str(object_hash_b64, digest_alg, false);
-    let full = format!("<SignedInfo xmlns=\"{NS_DSIG}\">{xml}</SignedInfo>");
-    c14n(full.as_bytes())
+    let inner = build_signed_info_inner_str(object_hash_b64, digest_alg, false);
+    let element = format!("<SignedInfo>{inner}</SignedInfo>");
+    // Canonicalize with the same parent context as in the final `.psdsxs` so the
+    // signed bytes match what Microsoft derives from `<Signature><SignedInfo>…`.
+    let canonical = c14n_dsig_element(&element, "SignedInfo")?;
+    // #region agent log
+    debug_log::log(
+        "E",
+        "xml_sig.rs:build_signed_info_xml",
+        "signedinfo canonical len",
+        &format!(r#"{{"canonical_len":{},"has_xmlns_on_si":{}}}"#, canonical.len(), std::str::from_utf8(&canonical).unwrap_or("").contains("SignedInfo xmlns")),
+    );
+    // #endregion
+    Ok(canonical)
 }
 
 /// Build `<SignedInfo>` for embedding in the final document (self-closing empty
