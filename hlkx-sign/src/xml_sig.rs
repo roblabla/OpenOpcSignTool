@@ -4,7 +4,6 @@
 //! follows the OPC digital signature specification (ECMA-376 Part 2 §13).
 
 use crate::c14n::c14n_dsig_element_committed;
-use crate::debug_log;
 use crate::opc::xml_escape_attr;
 use anyhow::{Context, Result};
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
@@ -165,19 +164,6 @@ pub fn build_signature_xml(
     // ── 2. Hash the canonical <Object> ──────────────────────────────────
     let object_hash = digest_alg.hash(&object_canonical);
     let object_hash_b64 = B64.encode(&object_hash);
-    // #region agent log
-    debug_log::log(
-        "D",
-        "xml_sig.rs:build_signature_xml",
-        "object canonical digest",
-        &format!(
-            r#"{{"object_hash_b64":"{}","canonical_len":{},"document_len":{}}}"#,
-            object_hash_b64,
-            object_canonical.len(),
-            object_document.len()
-        ),
-    );
-    // #endregion
 
     // ── 3. Build the canonical <SignedInfo> and sign it ──────────────────
     let signed_info_xml =
@@ -306,21 +292,6 @@ fn build_object_content(
                         );
                     }
                     TransformInfo::RelationshipTransform { source_types } => {
-                        // #region agent log
-                        debug_log::log(
-                            "G",
-                            "xml_sig.rs:build_object_content",
-                            "relationship transform selectors",
-                            &format!(
-                                r#"{{"selector_count":{},"unique_count":{}}}"#,
-                                source_types.len(),
-                                source_types
-                                    .iter()
-                                    .collect::<std::collections::HashSet<_>>()
-                                    .len()
-                            ),
-                        );
-                        // #endregion
                         xml.push_str("<Transform Algorithm=\"");
                         xml.push_str(REL_TRANSFORM_URL);
                         xml.push_str("\">");
@@ -391,14 +362,6 @@ pub(crate) fn build_signed_info_xml(
     let inner = build_signed_info_inner_str(object_hash_b64, digest_alg, false);
     let element = format!("<SignedInfo>{inner}</SignedInfo>");
     let canonical = c14n_dsig_element_committed(&element)?;
-    // #region agent log
-    debug_log::log(
-        "E",
-        "xml_sig.rs:build_signed_info_xml",
-        "signedinfo canonical len",
-        &format!(r#"{{"canonical_len":{},"has_xmlns_on_si":{}}}"#, canonical.len(), std::str::from_utf8(&canonical).unwrap_or("").contains("SignedInfo xmlns")),
-    );
-    // #endregion
     Ok(canonical)
 }
 

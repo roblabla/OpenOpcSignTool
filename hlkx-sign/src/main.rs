@@ -18,7 +18,6 @@
 //! argument.
 
 mod c14n;
-mod debug_log;
 mod opc;
 mod pkcs11;
 mod signing;
